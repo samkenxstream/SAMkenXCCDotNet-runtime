@@ -333,7 +333,11 @@ extern "C" void QCALLTYPE AssemblyNative_GetLocation(QCall::AssemblyHandle pAsse
     BEGIN_QCALL;
 
     {
+#if FEATURE_UNITY_EMBEDDING_INTERFACE
+        retString.Set(pAssembly->GetPath());
+#else
         retString.Set(pAssembly->GetPEAssembly()->GetPath());
+#endif
     }
 
     END_QCALL;

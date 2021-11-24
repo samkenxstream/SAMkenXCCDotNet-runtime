@@ -133,6 +133,22 @@ static void ScanStackRoots(Thread * pThread, promote_func* fn, ScanContext* sc)
         // Since we report every thing as pinned, we don't need to run following code for relocation phase.
         if (sc->promotion)
         {
+#if FEATURE_UNITY_EMBEDDING_INTERFACE
+            // Unity specific:
+            // Since we keep references to managed object in our native code, it is not sufficient
+            // to scan the known managed stack. We need to get the actual SP of the thread, so we can
+            // scan the entire stack, including any native code.
+            if (GetThread() != pThread)
+            {
+                T_CONTEXT ctx;
+                REGDISPLAY rd;
+                if (pThread->InitRegDisplay(&rd, &ctx, FALSE))
+                    topStack = (Object **)GetSP(&ctx);
+            }
+            else
+                topStack = (Object**)&topStack;
+
+#endif
             Object ** bottomStack = (Object **) pThread->GetCachedStackBase();
             Object ** walk;
             for (walk = topStack; walk < bottomStack; walk ++)

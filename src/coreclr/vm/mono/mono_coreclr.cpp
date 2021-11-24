@@ -1,0 +1,4131 @@
+#include "common.h"
+#include "MonoCoreClr.h"
+
+#include "assembly.hpp"
+#include "mscoree.h"
+#include "threads.h"
+#include "ecall.h"
+#include "stringliteralmap.h"
+#include "assemblynative.hpp"
+#include "typeparse.h"
+#include "typestring.h"
+#include "threadsuspend.h"
+#include "caparser.h"
+#include "../../gc/gcscan.h"
+#include "../../gc/objecthandle.h"
+#include "pathremapping.h"
+#include "threadlocalpoolallocator.h"
+
+#ifdef FEATURE_PAL
+#include "pal.h"
+#endif // FEATURE_PAL
+
+
+#ifdef WIN32
+#define EXPORT_API __declspec(dllexport)
+#define PATH_SEPARATOR ';'
+#else
+#define EXPORT_API __attribute__((visibility("default")))
+#define PATH_SEPARATOR ':'
+#endif
+
+//#define TRACE_API(format,...) { printf("%s (" format ")\n", __func__, __VA_ARGS__); fflush(stdout); }
+#define TRACE_API(format,...)
+
+ICLRRuntimeHost2* g_CLRRuntimeHost;
+MonoImage *gCoreCLRHelperAssembly;
+MonoClass* gALCWrapperClass;
+MonoObject* gALCWrapperObject;
+MonoMethod* gALCWrapperLoadFromAssemblyPathMethod;
+MonoMethod* gALCWrapperLoadFromAssemblyDataMethod;
+MonoMethod* gALCWrapperDomainUnloadNotificationMethod;
+MonoMethod* gALCWrapperInitUnloadMethod;
+MonoMethod* gALCWrapperFinishUnloadMethod;
+MonoMethod* gALCWrapperCheckRootForUnloadingMethod;
+MonoMethod* gALCWrapperCheckAssemblyForUnloadingMethod;
+MonoMethod* gALCWrapperAddPathMethod;
+
+thread_local MonoDomain *gCurrentDomain = NULL;
+MonoDomain *gRootDomain;
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+
+typedef const char*(*UnityFindPluginCallback)(const char*);
+static UnityFindPluginCallback unity_find_plugin_callback = NULL;
+
+MonoObject* GetMonoDomainObject(MonoDomain *domain)
+{
+    return mono_gchandle_get_target((guint32)(intptr_t)domain);
+}
+
+MonoDomain* CreateMonoDomainFromObject(MonoObject *o)
+{
+    return (MonoDomain*)(intptr_t)mono_gchandle_new(o, false);
+}
+
+CrstStatic g_gc_handles_lock;
+CrstStatic g_add_internal_lock;
+
+#define MONO_MAX_PATH 4096
+char s_AssemblyDir[MONO_MAX_PATH] = { 0 };
+char s_EtcDir[MONO_MAX_PATH] = { 0 };
+char s_AssemblyPaths[4096] = { 0 };
+
+// Import this function manually as it is not defined in a header
+extern "C" HRESULT  GetCLRRuntimeHost(REFIID riid, IUnknown **ppUnk);
+
+#define ASSERT_NOT_IMPLEMENTED printf("Function not implemented: %s\n", __func__);
+
+#define kCoreCLRHelpersDll "alc-wrapper.dll"
+#define FIELD_ATTRIBUTE_PRIVATE               0x0001
+#define FIELD_ATTRIBUTE_FAMILY                0x0004
+#define FIELD_ATTRIBUTE_PUBLIC                0x0006
+const int MONO_TABLE_TYPEDEF = 2;               // mono/metadata/blob.h
+
+struct MonoCustomAttrInfo_clr
+{
+    IMDInternalImport *import;
+    mdToken mdDef;
+    Assembly *assembly;
+};
+
+class GCNativeFrame : public Frame
+{
+    VPTR_VTABLE_CLASS(GCNativeFrame, Frame)
+
+public:
+
+    GCNativeFrame() {
+        stackBase = NULL;
+    };
+
+    VOID Pop();
+
+    virtual void GcScanRoots(promote_func *fn, ScanContext* sc)
+    {
+        for (UINT32 i=0; i<bits.GetCount(); i++)
+        {
+            UInt64 mask = bits[i];
+            for (int j=0; mask != 0; j++, mask >>= 1)
+            {
+                if (mask & 1)
+                {
+                    void *ptr = stackBase - (i * sizeof(UInt64) * 8) - j;
+                    fn ((PTR_PTR_Object)ptr, sc, 0);
+                }
+            }
+        }
+    }
+
+    void PushStackPtr(void **addr)
+    {
+        if (stackBase < addr)
+            stackBase = addr + 1024;
+        ptrdiff_t bitOffs = stackBase - addr;
+        size_t arrayIndex = bitOffs / (sizeof(UInt64) * 8);
+        UInt64 bitIndex = bitOffs % (sizeof(UInt64) * 8);
+        size_t count = bits.GetCount();
+        if (count < arrayIndex + 1)
+        {
+            bits.SetCount((COUNT_T)arrayIndex + 1);
+            for (size_t i=count;i<=arrayIndex;i++)
+                bits[(COUNT_T)i] = 0;
+        }
+        bits[(COUNT_T)arrayIndex] |= 1LL << bitIndex;
+    }
+
+    void PopStackPtr(void **addr)
+    {
+        ptrdiff_t bitOffs = stackBase - addr;
+        size_t arrayIndex = bitOffs / (sizeof(UInt64) * 8);
+        UInt64 bitIndex = bitOffs % (sizeof(UInt64) * 8);
+        if (bits.GetCount() > arrayIndex)
+            bits[(COUNT_T)arrayIndex] &= ~(1LL << bitIndex);
+    }
+
+private:
+    void **stackBase;
+    SArray<UInt64> bits;
+
+    // Keep as last entry in class
+    DEFINE_VTABLE_GETTER_AND_DTOR(GCNativeFrame)
+};
+
+#ifndef __GNUC__
+__declspec(thread) GCNativeFrame * pCurrentThreadNativeFrame;
+#else // !__GNUC__
+thread_local GCNativeFrame * pCurrentThreadNativeFrame;
+#endif // !__GNUC__
+
+thread_local int g_isManaged = 0;
+
+typedef Assembly MonoAssembly_clr;
+typedef Assembly MonoImage_clr;
+typedef Object MonoObject_clr;
+typedef FieldDesc MonoClassField_clr; // struct MonoClassField;
+typedef MethodTable MonoClass_clr; //struct MonoClass;
+typedef AppDomain MonoDomain_clr; //struct MonoDomain;
+typedef MethodDesc MonoMethod_clr;
+typedef OBJECTREF MonoObjectRef_clr;
+typedef TypeHandle MonoType_clr;
+typedef ArrayBase MonoArray_clr;
+typedef Thread MonoThread_clr;
+typedef MethodDesc MonoMethodSignature_clr;
+
+static inline MonoType_clr MonoType_clr_from_MonoType(MonoType* type)
+{
+    return MonoType_clr::FromPtr(type);
+}
+
+static inline MonoType* MonoType_clr_to_MonoType(MonoType_clr type)
+{
+    return (MonoType*)type.AsPtr();
+}
+
+static void get_dirname(char* source)
+{
+    for (size_t i = strlen(source) - 1; i >= 0; i--)
+    {
+        if (source[i] == '/' || source[i] == '\\')
+        {
+            source[i + 1] = '\0';
+            return;
+        }
+    }
+}
+
+MonoString* InvokeFindPluginCallback(MonoString* path)
+{
+    if (unity_find_plugin_callback)
+    {
+        const char* result = unity_find_plugin_callback(mono_string_to_utf8(path));
+        if (result != NULL)
+        {
+            const char *path_remapped = NULL;
+            if ((path_remapped = mono_unity_remap_path (result)))
+                result = path_remapped;
+
+            MonoString* result_mono = mono_string_new_wrapper(result);
+            free ((void*)path_remapped);
+            return result_mono;
+        }
+    }
+    return NULL;
+}
+
+// dummy function just to test that it is exported in coreclr so/dll
+extern "C" EXPORT_API void mono_test_export()
+{
+}
+
+extern "C" EXPORT_API int coreclr_array_length(MonoArray* array)
+{
+    ArrayBase* arrayObj = (ArrayBase*)array;
+
+    return arrayObj->GetNumComponents();
+}
+
+// switch to preemptive (true) or cooperative (false)
+// returns the previous state of the GC
+// TODO: Write equivalent to GCCoop with this function
+extern "C" gboolean mono_gc_preemptive(gboolean enable)
+{
+    Thread* thread = GetThread();
+    gboolean previousState = thread->PreemptiveGCDisabled() ? TRUE : FALSE;
+    if (enable)
+    {
+        if (previousState)
+        {
+            thread->EnablePreemptiveGC();
+            MONO_ASSERTE(!thread->PreemptiveGCDisabled());
+        }
+    }
+    else if (!previousState)
+    {
+        thread->DisablePreemptiveGC();
+        MONO_ASSERTE(thread->PreemptiveGCDisabled());
+    }
+    return previousState;
+}
+
+#ifdef _DEBUG
+extern "C" void mono_debug_assert_dialog(const char *szFile, int iLine, const char *szExpr)
+{
+    DbgAssertDialog(szFile, iLine, szExpr);
+}
+#endif
+
+extern "C" EXPORT_API void mono_thread_suspend_all_other_threads()
+{
+    ASSERT_NOT_IMPLEMENTED;
+    //TODO used once in Runtime\Mono\MonoManager.cpp CleanupMono()
+}
+
+extern "C" EXPORT_API void mono_thread_pool_cleanup()
+{
+    ASSERT_NOT_IMPLEMENTED;
+    //TODO used once in Runtime\Mono\MonoManager.cpp CleanupMono()
+}
+
+extern "C" EXPORT_API void mono_threads_set_shutting_down()
+{
+    ASSERT_NOT_IMPLEMENTED;
+    //TODO used once in Runtime\Mono\MonoManager.cpp CleanupMono()
+}
+
+extern "C" EXPORT_API void mono_runtime_set_shutting_down()
+{
+    ASSERT_NOT_IMPLEMENTED;
+    //TODO used once in Runtime\Mono\MonoManager.cpp CleanupMono()
+}
+
+extern "C" EXPORT_API gboolean mono_runtime_is_shutting_down()
+{
+    ASSERT_NOT_IMPLEMENTED;
+    //TODO not used
+    return FALSE;
+}
+
+extern "C" EXPORT_API gboolean mono_domain_finalize(MonoDomain *domain, int timeout)
+{
+    TRACE_API("%p, %d", domain, timeout);
+
+    GCInterface_WaitForPendingFinalizers();
+    return TRUE;
+}
+
+extern "C" EXPORT_API void mono_runtime_cleanup(MonoDomain *domain)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    //TODO not used
+}
+
+extern "C" EXPORT_API MonoMethod* mono_object_get_virtual_method(MonoObject *obj, MonoMethod *method)
+{
+    TRACE_API("%x, %x", obj, method);
+
+    MonoClass * klass = mono_object_get_class(obj);
+    MonoType * type = mono_class_get_type(klass);
+    if (mono_type_get_type(type) == MONO_TYPE_CLASS)
+        return method;
+
+    MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
+    MonoMethodSignature* sig = mono_method_signature(method);
+    MonoMethod *m2 = mono_class_get_method_from_name(klass, mono_method_get_name(method), mono_signature_get_param_count(sig));
+
+    return m2;
+}
+
+extern "C" EXPORT_API void mono_verifier_set_mode(MiniVerifierMode)
+{
+    // NOP
+    //TODO used in Runtime\Mono\MonoManager.cpp SetSecurityMode()
+}
+
+extern "C" EXPORT_API void mono_security_set_mode(MonoSecurityMode)
+{
+    // NOP
+    //TODO used in Runtime\Mono\MonoManager.cpp SetSecurityMode()
+}
+
+struct MonoInternalCallFrame
+{
+    FrameWithCookie<HelperMethodFrame> frame;
+    bool didSetupFrame;
+};
+
+static_assert(sizeof(MonoInternalCallFrame) <= sizeof(MonoInternalCallFrameOpaque), "MonoInternalCallFrameOpaque needs to be larger");
+
+// We currently need to wrap Unity icalls called from managed code mono_enter/exit_internal_call.
+// This has two reasons:
+// 1. We want to set up a CoreCLR stack frame for the icall to make call stack unwinding work 
+// (so we can get managed stack traces which cross native frames, as verified by the 
+// can_get_full_stack_trace_in_internal_method test).
+// 2. We want to switch the thread to preemptive GC mode when running our icalls, to avoid delays and 
+// deadlocks when the GC waits for the icall to finish.
+//
+// Now, the problem is that this adds some overhead to calling icalls, which is not insignificant for
+// small icalls (like Profiler.BeginSample). In most cases we can run icalls without wrapping them,
+// but it is not generally safe to do so. So we need to find a solution to selectively wrap icalls
+// only where needed.
+extern "C" EXPORT_API void mono_enter_internal_call(MonoInternalCallFrameOpaque *_frame)
+{
+    TRACE_API("%x", _frame);
+
+    FrameWithCookie<HelperMethodFrame>* frame = (FrameWithCookie<HelperMethodFrame>*)_frame;
+    memset((void*)frame, 0, sizeof(MonoInternalCallFrame));
+    new(frame) FrameWithCookie<HelperMethodFrame>(0, 0);
+
+    // Should we set up the frame? We only need to do this when calling the icall from CoreCLR JITed code, but not when
+    // calling it from Burst code (in which case GetThread() may not be valid if the worker thread is not attached).
+    ((MonoInternalCallFrame*)_frame)->didSetupFrame = GetThread() != NULL && GetThread()->PreemptiveGCDisabled();
+
+    // FCalls in CoreCLR always run in cooperative mode, as they are not written in a way which is 
+    // safe to use for the precice GC. However, for Unity ICalls (which use the same transition mechanism), 
+    // we cannot do that. Our icalls may often take non-trivial amounst of time, and in some cases use locking
+    // mechanisms, which can cause a deadlock, if we need to wait for it to exit to start GC on another thread.
+    // Because we disable the precise GC in Unity, we should be safe to interrupt our icalls for GC.
+    if (((MonoInternalCallFrame*)_frame)->didSetupFrame)
+    {
+        INDEBUG(static BOOL __haveCheckedRestoreState = FALSE;)
+        FORLAZYMACHSTATE_DEBUG_OK_TO_RETURN_BEGIN;
+        FORLAZYMACHSTATE(CAPTURE_STATE(frame->MachineState(), ret);)
+        FORLAZYMACHSTATE_DEBUG_OK_TO_RETURN_END;
+        INDEBUG(frame->SetAddrOfHaveCheckedRestoreState(&__haveCheckedRestoreState));
+        frame->Push();
+
+        GetThread()->EnablePreemptiveGC();
+    }
+}
+
+extern "C" EXPORT_API void mono_exit_internal_call(MonoInternalCallFrameOpaque *_frame)
+{
+    TRACE_API("%x", _frame);
+
+    FrameWithCookie<HelperMethodFrame>* frame = (FrameWithCookie<HelperMethodFrame>*)_frame;
+
+    if (((MonoInternalCallFrame*)_frame)->didSetupFrame)
+    {
+        GetThread()->DisablePreemptiveGC();
+        frame->Pop();
+    }
+    frame->~FrameWithCookie<HelperMethodFrame>();
+}
+
+extern "C" EXPORT_API void mono_add_internal_call(const char *name, gconstpointer method)
+{
+    TRACE_API("%s, %p", name, method);
+
+    assert(name != nullptr);
+    assert(method != nullptr);
+    CrstHolder lock(&g_add_internal_lock);
+    ECall::RegisterICall(name, (PCODE)method);
+}
+
+extern "C" EXPORT_API void mono_jit_cleanup(MonoDomain *domain)
+{
+    //TODO used once in Runtime\Mono\MonoManager.cpp CleanupMono()
+}
+
+extern "C" EXPORT_API MonoDomain* mono_jit_init(const char *file)
+{
+    TRACE_API("%s", file);
+
+    return mono_jit_init_version(file, "4.0");
+}
+
+void list_tpa(const wchar_t* searchPath, SString& tpa)
+{
+    SString searchPattern = searchPath;
+    searchPattern += W("/*.dll");
+    WIN32_FIND_DATAW findData;
+    HANDLE fileHandle = FindFirstFileW(searchPattern.GetUnicode(), &findData);
+
+    if (fileHandle != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            wchar_t pathToAdd[MONO_MAX_PATH];
+            wcscpy_s(pathToAdd, MONO_MAX_PATH, searchPath);
+            wcscat_s(pathToAdd, MONO_MAX_PATH, W("/"));
+            wcscat_s(pathToAdd, MONO_MAX_PATH, findData.cFileName);
+
+            tpa += pathToAdd;
+            tpa += PATH_SEPARATOR;
+        } while (FindNextFileW(fileHandle, &findData));
+        FindClose(fileHandle);
+    }
+}
+
+void SetupDomainPaths(MonoObject *alcObject)
+{
+    bool isSystemPath = true;
+    void* params[2] = { mono_string_new_wrapper(s_AssemblyDir), &isSystemPath};
+    mono_runtime_invoke(gALCWrapperAddPathMethod, alcObject, params, NULL);
+    isSystemPath = false;
+    params[0] = mono_string_new_wrapper(s_AssemblyPaths);
+    mono_runtime_invoke(gALCWrapperAddPathMethod, alcObject, params, NULL);
+}
+
+extern "C" EXPORT_API MonoDomain* mono_jit_init_version(const char *file, const char* runtime_version)
+{
+    g_gc_handles_lock.Init(CrstMonoHandles);
+    g_add_internal_lock.Init(CrstMonoICalls);
+
+    SetupMonoProcOverrides();
+
+    if (!g_CLRRuntimeHost)
+    {
+#if defined(__APPLE__) || defined(__linux__)
+        uint32_t lenActualPath = 0;
+        const char* entrypointExecutable = "/dev/null";
+        /*if (_NSGetExecutablePath(nullptr, &lenActualPath) == -1)
+        {
+            // OSX has placed the actual path length in lenActualPath,
+            // so re-attempt the operation
+            entrypointExecutable = new char[lenActualPath + 1];
+            entrypointExecutable[lenActualPath] = '\0';
+            if (_NSGetExecutablePath(entrypointExecutable, &lenActualPath) == -1)
+            {
+                delete [] entrypointExecutable;
+                return nullptr;
+            }
+        }
+        else
+        {
+            return nullptr;
+        }*/
+
+        DWORD error = PAL_InitializeCoreCLR(entrypointExecutable);
+
+        // If PAL initialization failed, then we should return right away and avoid
+        // calling any other APIs because they can end up calling into the PAL layer again.
+        if (error != S_OK)
+        {
+            return nullptr;
+        }
+#endif
+        HRESULT hr;
+        hr = GetCLRRuntimeHost(IID_ICLRRuntimeHost2, (IUnknown**)&g_CLRRuntimeHost);
+
+        if(FAILED(hr))
+        {
+            return nullptr;
+        }
+
+        ICLRRuntimeHost2* host = g_CLRRuntimeHost;
+
+		hr = host->SetStartupFlags(static_cast<STARTUP_FLAGS>(
+			STARTUP_FLAGS::STARTUP_CONCURRENT_GC | STARTUP_FLAGS::STARTUP_SINGLE_APPDOMAIN | STARTUP_FLAGS::STARTUP_LOADER_OPTIMIZATION_SINGLE_DOMAIN));
+
+        if(FAILED(hr))
+        {
+            return nullptr;
+        }
+
+		hr = host->Start();
+
+        if(FAILED(hr))
+        {
+            return nullptr;
+        }
+
+        const wchar_t *property_keys[] = {
+            W("TRUSTED_PLATFORM_ASSEMBLIES"),
+            W("APP_PATHS"),
+            W("APP_NI_PATHS"),
+            W("NATIVE_DLL_SEARCH_DIRECTORIES")
+        };
+
+        wchar_t appPath[MONO_MAX_PATH] = { 0 };
+        Wsz_mbstowcs(appPath, s_AssemblyDir, MONO_MAX_PATH);
+
+        wchar_t etcPath[MONO_MAX_PATH] = { 0 };
+        Wsz_mbstowcs(etcPath, s_EtcDir, MONO_MAX_PATH);
+
+        wchar_t assemblyPaths[4096] = { 0 };
+        Wsz_mbstowcs(assemblyPaths, s_AssemblyPaths, 4096);
+
+        SString tpa;
+        list_tpa(appPath, tpa);
+
+        SString appPaths;
+        appPaths += appPath;
+        appPaths += PATH_SEPARATOR;
+        appPaths += assemblyPaths;
+
+        SString appNiPaths;
+        appNiPaths += appPath;
+        appNiPaths+= PATH_SEPARATOR;
+        appNiPaths += appPath;
+
+        SString nativeDllSearchDirs;
+        nativeDllSearchDirs += appPath;
+        nativeDllSearchDirs += PATH_SEPARATOR;
+        nativeDllSearchDirs += etcPath;
+
+        const wchar_t *property_values[] = {
+                  tpa.GetUnicode(),
+                  appPaths,
+                  appNiPaths.GetUnicode(),
+                  nativeDllSearchDirs.GetUnicode()
+        };
+
+        // TODO: This is not safe
+        wchar_t  wfile[MONO_MAX_PATH];
+        Wsz_mbstowcs(wfile, file, MONO_MAX_PATH); // check if null terminated
+
+        DWORD domainId;
+        hr = host->CreateAppDomainWithManager(
+            wfile,   // The friendly name of the AppDomain
+                     // Flags:
+                     // APPDOMAIN_ENABLE_PLATFORM_SPECIFIC_APPS
+                     // - By default CoreCLR only allows platform neutral assembly to be run. To allow
+                     //   assemblies marked as platform specific, include this flag
+                     //
+                     // APPDOMAIN_ENABLE_PINVOKE_AND_CLASSIC_COMINTEROP
+                     // - Allows sandboxed applications to make P/Invoke calls and use COM interop
+                     //
+                     // APPDOMAIN_SECURITY_SANDBOXED
+                     // - Enables sandboxing. If not set, the app is considered full trust
+                     //
+                     // APPDOMAIN_IGNORE_UNHANDLED_EXCEPTION
+                     // - Prevents the application from being torn down if a managed exception is unhandled
+                     //
+            APPDOMAIN_ENABLE_PLATFORM_SPECIFIC_APPS |
+            APPDOMAIN_ENABLE_PINVOKE_AND_CLASSIC_COMINTEROP |
+            APPDOMAIN_DISABLE_TRANSPARENCY_ENFORCEMENT,
+            NULL,                // Name of the assembly that contains the AppDomainManager implementation
+            NULL,                    // The AppDomainManager implementation type name
+            sizeof(property_keys) / sizeof(wchar_t*),  // The number of properties
+            property_keys,
+            property_values,
+            &domainId);
+
+        if(FAILED(hr))
+        {
+            return nullptr;
+        }
+    }
+
+    AppDomain *pCurDomain = SystemDomain::GetCurrentDomain();
+    
+    Assembly* coreClrHelperAssembly = NULL;
+    char *assemblyPaths = _strdup(s_AssemblyPaths);
+    char *assemblyPathsPtr = assemblyPaths;
+    while (assemblyPaths)
+    {
+        char* next = strchr(assemblyPaths, PATH_SEPARATOR);
+        if (next)
+        {
+            *next = '\0';
+            next++;
+        }
+        SString assemblyPath(SString::Utf8, assemblyPaths);
+        assemblyPath += '/';
+        assemblyPath += SString(SString::Utf8, kCoreCLRHelpersDll);
+        
+        EX_TRY
+        {
+            coreClrHelperAssembly = AssemblySpec::LoadAssembly(assemblyPath.GetUnicode());
+        }
+        EX_CATCH
+        {
+            Exception *ex = GET_EXCEPTION();
+            if (EEFileLoadException::GetFileLoadKind(ex->GetHR()) != kFileNotFoundException)
+                EX_RETHROW;
+        }
+        EX_END_CATCH(RethrowTerminalExceptions);
+
+        if (coreClrHelperAssembly != NULL)
+            break;
+
+        assemblyPaths = next;
+    }
+
+    free(assemblyPathsPtr);
+    coreClrHelperAssembly->EnsureActive();
+    gCoreCLRHelperAssembly = (MonoImage*)coreClrHelperAssembly;
+    gALCWrapperClass = mono_class_from_name(gCoreCLRHelperAssembly, "Unity.CoreCLRHelpers", "ALCWrapper");
+    gALCWrapperObject = mono_object_new(NULL, gALCWrapperClass);
+    mono_runtime_object_init(gALCWrapperObject);
+    gALCWrapperLoadFromAssemblyPathMethod = mono_class_get_method_from_name(gALCWrapperClass, "CallLoadFromAssemblyPath", 1);
+    gALCWrapperLoadFromAssemblyDataMethod = mono_class_get_method_from_name(gALCWrapperClass, "CallLoadFromAssemblyData", 2);
+    gALCWrapperDomainUnloadNotificationMethod = mono_class_get_method_from_name(gALCWrapperClass, "DomainUnloadNotification", 0);
+    gALCWrapperInitUnloadMethod = mono_class_get_method_from_name(gALCWrapperClass, "InitUnload", 0);
+    gALCWrapperFinishUnloadMethod = mono_class_get_method_from_name(gALCWrapperClass, "FinishUnload", 1);
+    gALCWrapperCheckRootForUnloadingMethod = mono_class_get_method_from_name(gALCWrapperClass, "CheckRootForUnloading", 2);
+    gALCWrapperCheckAssemblyForUnloadingMethod = mono_class_get_method_from_name(gALCWrapperClass, "CheckAssemblyForUnloading", 1);
+    gALCWrapperAddPathMethod = mono_class_get_method_from_name(gALCWrapperClass, "AddPath", 2);
+
+    gCurrentDomain = CreateMonoDomainFromObject(gALCWrapperObject);
+    SetupDomainPaths(gALCWrapperObject);
+    gRootDomain = gCurrentDomain;
+
+    mono_add_internal_call("Unity.CoreCLRHelpers.ALCWrapper::InvokeFindPluginCallback", (gconstpointer)InvokeFindPluginCallback);
+
+/*
+    FrameWithCookie<GCNativeFrame>* frame = (FrameWithCookie<GCNativeFrame>*)malloc(sizeof(FrameWithCookie<GCNativeFrame>));
+    new (frame) FrameWithCookie<GCNativeFrame> ();
+    pCurrentThreadNativeFrame = &(*frame);
+    frame->Push();*/
+
+
+    TRACE_API("%s, %s", file, runtime_version);
+    return gCurrentDomain;
+}
+
+extern "C" EXPORT_API int mono_jit_exec(MonoDomain *domain, MonoAssembly *assembly, int argc, char *argv[])
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return 0;
+}
+
+extern "C" EXPORT_API void* mono_jit_info_get_code_start(void* jit)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    // TODO used 1 by instrumentation unity/mono profiler
+    // Runtime\Profiler\Instrumentation\InstrumentationProfiler.cpp(292)
+    return NULL;
+}
+
+extern "C" EXPORT_API int mono_jit_info_get_code_size(void* jit)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    // TODO used 1 by instrumentation unity/mono profiler
+    // Runtime\Profiler\Instrumentation\InstrumentationProfiler.cpp(292)
+    return 0;
+}
+
+#if UNITY_SUPPORT_DOMAIN_UNLOAD
+
+struct ScannedObjectElement
+{
+    ScannedObjectElement(Object *_o, bool _isAlc)
+        : o(_o), isAlc(_isAlc) 
+    {}
+    ScannedObjectElement()
+        : o(NULL), isAlc(false) 
+    {}
+
+    Object* o;
+    bool isAlc;
+};
+
+class ScannedObjectTraits : public NoRemoveSHashTraits< DefaultSHashTraits<ScannedObjectElement> >
+{
+public:
+    typedef Object* key_t;
+    static key_t GetKey(element_t e)       { LIMITED_METHOD_CONTRACT; return e.o; }
+    static BOOL Equals(key_t k1, key_t k2) { LIMITED_METHOD_CONTRACT; return (k1 == k2); }
+    static count_t Hash(key_t k)           { LIMITED_METHOD_CONTRACT; return (count_t)(size_t)k; }
+    static const element_t Null()          { LIMITED_METHOD_CONTRACT; return ScannedObjectElement(); }
+    static bool IsNull(const element_t &e) { LIMITED_METHOD_CONTRACT; return (e.o == NULL); }
+};
+
+bool RecurseForALCReferences(Object *o, MethodTable *mt, bool isNestedObject, LoaderAllocator* loaderAllocator, Object* loaderAllocatorManaged, SHash<ScannedObjectTraits> *scanned)
+{
+#ifdef DEBUG_ALC_UNLOADING
+    printf("RecurseForALCReferences %p %d %s\n", o, isNestedObject, mono_class_get_name((MonoClass*)mt));
+#endif
+
+    if (o == nullptr)
+        return false;
+
+    if (const ScannedObjectElement * isAlcObject = scanned->LookupPtr(o))
+        return isAlcObject->isAlc;
+
+    if (mt->GetAssembly()->GetLoaderAllocator() == loaderAllocator || o == loaderAllocatorManaged)
+    {
+        scanned->AddOrReplace(ScannedObjectElement(o, true));
+        return true;
+    }
+
+    scanned->AddOrReplace(ScannedObjectElement(o, false));
+    if (mt->IsString())
+        return false; // No need to look further, strings don't have references
+
+    if (mt->IsArray())
+    {
+        ArrayBase* arrayObj = (ArrayBase*)o;
+
+        auto length = arrayObj->GetNumComponents();
+        auto elementType = mt->GetArrayElementTypeHandle();
+        auto elementSize = elementType.GetSize();
+        size_t headerSize = sizeof(void*) * 2 * mt->GetRank();
+    #ifdef DEBUG_ALC_UNLOADING
+        printf("Array %s %p %d * %d = %d\n", mono_class_get_name((MonoClass*)mt), o, elementSize, length, o->GetSize());
+    #endif    
+        if (!elementType.IsPointer())
+        {
+            if (!elementType.IsValueType())
+            {
+                for (DWORD i=0;i<length;i++)
+                {
+                #ifdef DEBUG_ALC_UNLOADING
+                    printf("Array element %s (reference) %d/%d\n", mono_class_get_name((MonoClass*)mt), i, length);
+                #endif
+
+                    auto element = (Object**)(headerSize + i * elementSize + (char*)o);
+                    if (*element == NULL)
+                        continue;
+                    if (RecurseForALCReferences(*element, (**element).GetMethodTable(), false, loaderAllocator, loaderAllocatorManaged, scanned))
+                        *element = NULL;
+                }
+            }
+            else if (!elementType.IsBlittable())
+            {
+                auto elementMT = elementType.AsMethodTable();
+                for (DWORD i=0;i<length;i++)
+                {
+                #ifdef DEBUG_ALC_UNLOADING
+                    printf("Array element %s (value) %d/%d\n", mono_class_get_name((MonoClass*)mt), i, length);
+                #endif
+                    auto element = (Object*)(headerSize + i * elementSize + (char*)o);
+                    RecurseForALCReferences(element, elementMT, true, loaderAllocator, loaderAllocatorManaged, scanned);
+                }
+            } 
+        }       
+    }
+
+    DeepFieldDescIterator iterator(mt, ApproxFieldDescIterator::INSTANCE_FIELDS);
+    while (auto field = iterator.Next())
+    {
+        auto typeHandle = field->GetFieldTypeHandleThrowing();
+        if (typeHandle.IsPointer())
+            continue;
+
+        size_t fieldOffset = field->GetOffset(); 
+        if (!isNestedObject)
+            fieldOffset += sizeof(Object);
+
+    #ifdef DEBUG_ALC_UNLOADING
+        printf("Field %s.%s %d (offset %d)\n", mono_class_get_name((MonoClass*)mt), mono_field_get_name((MonoClassField*)field), isNestedObject, fieldOffset);
+    #endif    
+
+        if (typeHandle.IsValueType())
+        {
+            Object* fieldObject = (Object*)((char*)o + fieldOffset);
+            RecurseForALCReferences(fieldObject, typeHandle.AsMethodTable(), true, loaderAllocator, loaderAllocatorManaged, scanned);
+        }
+        else if (!typeHandle.IsBlittable())
+        {
+            Object** fieldObject = (Object**)((char*)o + fieldOffset);
+            if (*fieldObject == NULL)
+                continue;
+            if (RecurseForALCReferences(*fieldObject, (**fieldObject).GetMethodTable(), false, loaderAllocator, loaderAllocatorManaged, scanned))
+                *fieldObject = NULL;
+        }
+    }
+    return false;
+}
+
+bool CheckRootForUnloading(Object* o, LoaderAllocator* loaderAllocator, Object* loaderAllocatorManaged)
+{
+    SHash<ScannedObjectTraits> scanned;
+    return RecurseForALCReferences(o, o->GetMethodTable(), false, loaderAllocator, loaderAllocatorManaged, &scanned);
+}
+
+void HandleRootCallbackPass1(Object** ppObject, ScanContext* sc, uint32_t flags)
+{
+    auto alcObject = (AssemblyLoadContextBaseObject*)sc->_unused1;
+    auto nativeALC = (CLRPrivBinderAssemblyLoadContext*)alcObject->GetNativeAssemblyLoadContext();
+    LoaderAllocator *loaderAllocator = NULL;
+    nativeALC->GetLoaderAllocator((void**)&loaderAllocator);
+#ifdef DEBUG_ALC_UNLOADING
+    printf("Check root %p->%p (%p)\n", ppObject, *ppObject, alcObject);
+#endif    
+    Object* loaderAllocatorManaged = OBJECTREFToObject(loaderAllocator->GetExposedObject());
+    if (CheckRootForUnloading(*ppObject, loaderAllocator, loaderAllocatorManaged))
+        *ppObject = NULL;
+}
+
+// For subsequent attempts to unload, it is not save to access the loader allocator, as
+// that may no longer be valid. So we try a more simple approach.
+void HandleRootCallbackPass2(Object** ppObject, ScanContext* sc, uint32_t flags)
+{
+    auto alcObject = (AssemblyLoadContextBaseObject*)sc->_unused1;
+#ifdef DEBUG_ALC_UNLOADING
+    printf("Check root2 %p->%p (%p)\n", ppObject, *ppObject, alcObject);
+#endif    
+    if (*ppObject == alcObject)
+        *ppObject = NULL;
+}
+
+void CheckRootsForDomainUnload(MonoObject* alcObject, promote_func* fn)
+{
+    GCX_COOP();
+
+    ScanContext sc;
+    sc.thread_number = 0;
+    sc.promotion = TRUE;
+    sc.concurrent = FALSE;
+    sc._unused1 = alcObject;
+    GCScan::GcScanHandles(fn, 2, 2, &sc);
+}
+
+struct CheckThreadData
+{
+    bool shouldKill;
+    LoaderAllocator* loaderAllocator;
+};
+
+StackWalkAction ShouldKillThread(CrawlFrame* pCf, VOID* data)
+{
+    CheckThreadData* threadData = (CheckThreadData*)data;
+    MethodDesc *pFunc = pCf->GetFunction();
+    threadData->shouldKill = pFunc->GetLoaderAllocator() == threadData->loaderAllocator;
+    return threadData->shouldKill ? SWA_ABORT : SWA_CONTINUE;
+}
+
+void CheckThreadsForDomainUnload(MonoObject* _alcObject)
+{
+    GCX_COOP();
+
+    CheckThreadData data;
+    auto alcObject = (AssemblyLoadContextBaseObject*)_alcObject;
+    auto nativeALC = (CLRPrivBinderAssemblyLoadContext*)alcObject->GetNativeAssemblyLoadContext();
+    nativeALC->GetLoaderAllocator((void**)&data.loaderAllocator);
+
+    EX_TRY
+    {
+        Thread* killMe = NULL;
+        do
+        {
+            killMe = NULL;
+            // Suspend the runtime.
+            ThreadSuspend::SuspendEE(ThreadSuspend::SUSPEND_OTHER);
+
+            // Walk all other threads.
+            Thread* pThread = nullptr;
+            Thread* currentThread = GetThread();
+
+            while ((pThread = ThreadStore::GetThreadList(pThread)) != nullptr)
+            {
+                if (pThread == currentThread)
+                    continue;
+                data.shouldKill = false;
+                pThread->StackWalkFrames(ShouldKillThread, &data, FUNCTIONSONLY | LIGHTUNWIND | ALLOW_ASYNC_STACK_WALK);
+
+                if (data.shouldKill)
+                {
+                    killMe = pThread;
+                    break;
+                }
+            }
+
+            // Restart the runtime.
+            ThreadSuspend::RestartEE(FALSE, TRUE);
+            
+            if (killMe)
+            {
+                printf("kill thread %p\n", killMe);
+                killMe->OSAbort();
+                Sleep(1);
+            }
+        } while (killMe != NULL);
+
+    }
+    EX_CATCH
+    {
+    }
+    EX_END_CATCH(SwallowAllExceptions);
+}
+
+#endif
+
+struct LoadedImage{
+    char* name;
+    MonoImage *image;
+    MonoDomain *domain;
+    LoadedImage(const char* _name, MonoImage* _image, MonoDomain* _domain)
+    {
+        image = _image;
+        domain = _domain;
+        const char * namepos = strrchr(_name, '/');
+        if (namepos)
+            _name = namepos + 1;
+        name = (char*)malloc(strlen(_name) + 1);
+        strcpy(name, _name);
+        char* suffix = strstr(name, ".dll");
+        if (suffix)
+            *suffix = '\0';
+    }
+    LoadedImage() {}
+};
+SArray<LoadedImage> *g_LoadedImages = NULL;
+
+MonoClass * mono_class_from_name(MonoImage *image, const char* name_space, const char *name, bool ignoreCase)
+{
+    CONTRACTL
+    {
+        THROWS;
+        GC_TRIGGERS;
+        // We don't support multiple domains
+        PRECONDITION(image != nullptr);
+        PRECONDITION(name_space != nullptr);
+        PRECONDITION(name != nullptr);
+    }
+    CONTRACTL_END;
+    GCX_COOP();
+    auto assembly = (MonoAssembly_clr*)image;
+    DomainAssembly* domainAssembly = assembly->GetDomainAssembly();
+
+    InlineSString<512> fullTypeName(SString::Utf8, name_space);
+    fullTypeName.AppendUTF8(".");
+    fullTypeName.AppendUTF8(name);
+    SString::Iterator i = fullTypeName.Begin();
+    while (fullTypeName.Find(i, W('/')))
+        fullTypeName.Replace(i, W('+'));
+
+    OBJECTREF keepAlive = NULL;
+    if (g_LoadedImages != NULL)
+    {
+        for (COUNT_T i=0; i<g_LoadedImages->GetCount(); i++)
+        {
+            if ((*g_LoadedImages)[i].image == image)
+            {
+                MonoDomain *domain = (*g_LoadedImages)[i].domain;
+                Object* domainObj = (Object*)GetMonoDomainObject(domain);
+                keepAlive = ObjectToOBJECTREF(domainObj);
+                break;
+            }
+        }
+    }
+
+    TypeHandle retTypeHandle = TypeName::GetTypeManaged(fullTypeName.GetUnicode(), domainAssembly, FALSE, ignoreCase, TRUE, NULL, &keepAlive);
+
+    if (!retTypeHandle.IsNull())
+    {
+        return (MonoClass*)retTypeHandle.AsMethodTable();
+    }
+
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoClass * mono_class_from_name(MonoImage *image, const char* name_space, const char *name)
+{
+    TRACE_API("%x, %s, %s", image, name_space, name);
+
+    return mono_class_from_name(image, name_space, name, false);
+}
+
+extern "C" EXPORT_API MonoClass * mono_class_from_name_case(MonoImage *image, const char* name_space, const char *name)
+{
+    TRACE_API("%x, %s, %s", image, name_space, name);
+
+    return mono_class_from_name(image, name_space, name, true);
+}
+
+extern "C" EXPORT_API MonoAssembly * mono_domain_assembly_open(MonoDomain *domain, const char *name)
+{
+    TRACE_API("%x, %s", domain, name);
+
+    GCX_COOP();
+    
+	const char *path_remapped = NULL;
+	if ((path_remapped = mono_unity_remap_path (name)))
+		name = path_remapped;
+
+    void* params[1] = { mono_string_new_wrapper(name) };
+    auto assemblyObject = (AssemblyBaseObject*)mono_runtime_invoke(gALCWrapperLoadFromAssemblyPathMethod, GetMonoDomainObject(domain), params, NULL);
+    free ((void*)path_remapped);
+    if (assemblyObject == NULL)
+        return NULL;
+
+    auto assembly = assemblyObject->GetAssembly();
+    assembly->EnsureActive();
+
+    if (g_LoadedImages == NULL)
+        g_LoadedImages = new SArray<LoadedImage>;
+    g_LoadedImages->Append(LoadedImage(name, (MonoImage*)assembly, domain));
+
+    return (MonoAssembly*)assembly;
+}
+
+extern "C" EXPORT_API MonoDomain * mono_domain_create_appdomain(const char *domainname, const char* configfile)
+{
+    auto alcWrapperObject = mono_object_new(NULL, gALCWrapperClass);
+    mono_runtime_object_init(alcWrapperObject);
+    SetupDomainPaths(alcWrapperObject);
+    return CreateMonoDomainFromObject(alcWrapperObject);
+}
+
+void UnloadFailure()
+{
+    // Set a breakpoint here to debug ALC unload issues.
+    printf("Failed to unload Domain\n");
+}
+
+#if UNITY_SUPPORT_DOMAIN_UNLOAD
+
+MonoObject* domain_unload(MonoDomain* domain)
+{
+    auto alcObject = GetMonoDomainObject(domain);
+
+    guint32 alcObjectHandle = mono_gchandle_new_weakref(alcObject, false);
+    mono_runtime_invoke(gALCWrapperDomainUnloadNotificationMethod, alcObject, NULL, NULL);
+
+    mono_gchandle_free((guint32)domain);
+    
+    MonoObject* exception;
+    MonoObject* weakref;
+
+    // In most cases a single attempt to unload the ALC will be successful.
+    // However, this will fail if new roots are created during unloading. This can
+    // happen, if a finalizer creates a root. To catch such cases, we attempt to 
+    // unload multiple times.
+    #define kMaxUnloadAttempts 3
+    for (int i=0; i<kMaxUnloadAttempts; i++)
+    {
+        CheckThreadsForDomainUnload(alcObject);
+        CheckRootsForDomainUnload(alcObject, i == 0 ? HandleRootCallbackPass1 : HandleRootCallbackPass2);
+
+        if (i==0)
+            weakref = mono_runtime_invoke(gALCWrapperInitUnloadMethod, alcObject, NULL, NULL);
+
+        guint32 weakrefhandle = mono_gchandle_new_weakref(weakref, false);
+
+        // Make sure that no GC is in progress while we switch mode.
+        while (GCHeapUtilities::IsGCInProgress(false))
+            GCHeapUtilities::WaitForGCCompletion(false);
+        // Make sure that no garbage references on the stack can prevent unloading.
+        g_pConfig->SetGCConservative(false);
+
+        void* params[1] = { weakref };
+        exception = mono_runtime_invoke(gALCWrapperFinishUnloadMethod, NULL, params, NULL);
+
+        while (GCHeapUtilities::IsGCInProgress(false))
+            GCHeapUtilities::WaitForGCCompletion(false);
+        g_pConfig->SetGCConservative(true);
+
+        if (exception == nullptr)
+            break;
+
+        // Since we ran a GC, these objects might have moved. Restore them from their handles
+        // in case we need them for running another attempt.
+        alcObject = mono_gchandle_get_target(alcObjectHandle);
+        weakref = mono_gchandle_get_target(weakrefhandle);
+    }
+
+#ifdef DEBUG_ALC_UNLOADING
+    fflush(stdout);
+#endif    
+
+    if (exception != nullptr)
+        UnloadFailure();
+
+    return exception;
+}
+
+#endif
+
+extern "C" EXPORT_API void mono_set_gc_conservative(bool conservative)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    // JON TODO: I set this in config. Do we need this set here still?
+    //g_pConfig->SetGCConservative(conservative);
+}
+
+#if UNITY_SUPPORT_DOMAIN_UNLOAD
+extern "C" EXPORT_API void mono_domain_unload(MonoDomain* domain)
+{
+    TRACE_API("%p", domain);
+
+    domain_unload(domain);
+}
+
+extern "C" EXPORT_API void mono_unity_domain_unload(MonoDomain * domain, MonoUnityExceptionFunc callback)
+{
+    TRACE_API("%p %p", domain, callback);
+
+    MonoObject *exc = domain_unload(domain);
+    if (exc)
+        callback(exc);
+}
+
+#endif
+
+extern "C" EXPORT_API MonoObject* mono_object_new(MonoDomain *domain, MonoClass *klass)
+{
+    TRACE_API("%x, %x", domain, klass);
+
+    CONTRACTL
+    {
+        THROWS;
+        GC_TRIGGERS;
+        PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+    {
+        GCX_COOP();
+        OBJECTREF objectRef = AllocateObject((MethodTable*)klass);
+        return (MonoObject*)OBJECTREFToObject(objectRef);
+    }
+}
+
+extern "C" EXPORT_API void mono_runtime_object_init(MonoObject *this_obj)
+{
+    TRACE_API("%x", this_obj);
+
+    CONTRACTL
+    {
+        THROWS;
+        GC_TRIGGERS;
+        PRECONDITION(this_obj != NULL);
+    }
+    CONTRACTL_END;
+
+    GCX_COOP();
+
+    // TODO check what to do with the exception thrown by CallDefaultConstructor
+    OBJECTREF objref = ObjectToOBJECTREF((MonoObject_clr*)this_obj);
+    GCPROTECT_BEGIN(objref);
+    {
+        CallDefaultConstructor(objref);
+    }
+    GCPROTECT_END();
+}
+
+
+
+extern "C" EXPORT_API MonoObject* mono_runtime_invoke(MonoMethod *method, void *obj, void **params, MonoException **exc)
+{
+    TRACE_API("%p, %p, %p, %p", method, obj, params, exc);
+
+    if (obj == nullptr)
+        return mono_runtime_invoke_with_nested_object(method, nullptr, nullptr, params, exc);
+    MonoClass_clr * klass = (MonoClass_clr*)mono_object_get_class((MonoObject*)obj);
+    auto method_clr = (MonoMethod_clr*)method;
+    if (klass->IsValueType())// && !method_clr->IsVtableMethod())
+        return mono_runtime_invoke_with_nested_object(method, (char*)obj + sizeof(Object), obj, params, exc);
+    else
+        return mono_runtime_invoke_with_nested_object(method, obj, obj, params, exc);
+}
+
+extern "C" EXPORT_API MonoObject* mono_runtime_invoke_with_nested_object(MonoMethod *method, void *obj, void *parentobj, void **params, MonoException **exc)
+{
+    TRACE_API("%p, %p, %p, %p, %p", method, obj, parentobj, params, exc);
+
+    GCX_COOP();
+
+    auto method_clr = (MonoMethod_clr*)method;
+
+    MetaSig     methodSig(method_clr);
+    DWORD numArgs = methodSig.NumFixedArgs();
+    ArgIterator argIt(&methodSig);
+
+    const int MAX_ARG_SLOT = 128;
+    ARG_SLOT argslots[MAX_ARG_SLOT];
+
+    DWORD slotIndex = 0;
+    if (methodSig.HasThis())
+    {
+        if (obj != parentobj && method_clr->IsVtableMethod())
+            obj = (char*)obj - sizeof(Object) ;
+        argslots[0] = PtrToArgSlot(obj);
+        slotIndex++;
+    }
+
+    PVOID pRetBufStackCopy = NULL;
+    auto retTH = methodSig.GetRetTypeHandleNT();
+    CorElementType retType = retTH.GetInternalCorElementType();
+
+    auto hasReturnBufferArg = argIt.HasRetBuffArg();
+    if (hasReturnBufferArg)
+    {
+        SIZE_T sz = retTH.GetMethodTable()->GetNumInstanceFieldBytes();
+        pRetBufStackCopy = _alloca(sz);
+        memset(pRetBufStackCopy, 0, sz);
+        argslots[slotIndex] = PtrToArgSlot(pRetBufStackCopy);
+        slotIndex++;
+    }
+
+    for (DWORD argIndex = 0; argIndex < numArgs; argIndex++, slotIndex++)
+    {
+        int ofs = argIt.GetNextOffset();
+        _ASSERTE(ofs != TransitionBlock::InvalidOffset);
+        auto stackSize = argIt.GetArgSize();
+
+        auto argTH = methodSig.GetLastTypeHandleNT();
+        auto argType = argTH.GetInternalCorElementType();
+
+        // TODO: Factorize ValueType detection and Managed detection
+        switch (argType)
+        {
+        case ELEMENT_TYPE_VALUETYPE:
+        case ELEMENT_TYPE_BOOLEAN:      // boolean
+        case ELEMENT_TYPE_I1:           // byte
+        case ELEMENT_TYPE_U1:
+        case ELEMENT_TYPE_I2:           // short
+        case ELEMENT_TYPE_U2:
+        case ELEMENT_TYPE_CHAR:         // char
+        case ELEMENT_TYPE_I4:           // int
+        case ELEMENT_TYPE_U4:
+        case ELEMENT_TYPE_I8:           // long
+        case ELEMENT_TYPE_U8:
+        case ELEMENT_TYPE_R4:           // float
+        case ELEMENT_TYPE_R8:           // double
+        case ELEMENT_TYPE_I:
+        case ELEMENT_TYPE_U:
+            switch (stackSize)
+            {
+            case 1:
+            case 2:
+            case 4:
+                argslots[slotIndex] = *(INT32*)params[argIndex];
+                break;
+
+            case 8:
+                argslots[slotIndex] = *(INT64*)params[argIndex];
+                break;
+
+            default:
+                if (stackSize > sizeof(ARG_SLOT))
+                {
+                    argslots[slotIndex] = PtrToArgSlot(params[argIndex]);
+                }
+                else
+                {
+                    CopyMemory(&argslots[slotIndex], params[argIndex], stackSize);
+                }
+                break;
+            }
+            break;
+        case ELEMENT_TYPE_BYREF:
+            argslots[slotIndex] = PtrToArgSlot(params[argIndex]);
+            break;
+        case ELEMENT_TYPE_PTR:
+            argslots[slotIndex] = PtrToArgSlot(params[argIndex]);
+            break;
+        case ELEMENT_TYPE_STRING:
+        case ELEMENT_TYPE_OBJECT:
+        case ELEMENT_TYPE_CLASS:
+        case ELEMENT_TYPE_ARRAY:
+        case ELEMENT_TYPE_SZARRAY:
+        case ELEMENT_TYPE_VAR:
+            argslots[slotIndex] = ObjToArgSlot(ObjectToOBJECTREF((MonoObject_clr*)params[argIndex]));
+            break;
+        default:
+            assert(false && "This argType is not supported");
+            break;
+        }
+    }
+
+    // TODO: Convert params to ARG_SLOT
+
+    g_isManaged++;
+    ARG_SLOT result = NULL;
+    EX_TRY
+    {
+        MonoClass_clr * klass = (MonoClass_clr*)mono_method_get_class(method);
+
+        OBJECTREF objref = ObjectToOBJECTREF((Object*)parentobj);
+        MethodDescCallSite invoker((MonoMethod_clr*)method, &objref);
+        result = invoker.Call_RetArgSlot(argslots);
+    }
+    EX_CATCH
+    {
+        SString sstr;
+        GET_EXCEPTION()->GetMessage(sstr);
+        StackScratchBuffer buffer;
+        printf("Exception calling %s: %s\n", mono_method_get_name(method), sstr.GetUTF8(buffer));
+        fflush(stdout);
+
+        if (exc && GET_EXCEPTION()->IsType(CLRException::GetType()))
+            *exc = (MonoException*)OBJECTREFToObject(((CLRException*)GET_EXCEPTION())->GetThrowable());
+    }
+    EX_END_CATCH(SwallowAllExceptions)
+    g_isManaged--;
+
+    methodSig.Reset();
+    if (methodSig.IsReturnTypeVoid())
+    {
+        return nullptr;
+    }
+
+    // Check reflectioninvocation.cpp
+    // TODO: Handle
+    switch (retType)
+    {
+        case ELEMENT_TYPE_VALUETYPE:
+        case ELEMENT_TYPE_BOOLEAN:      // boolean
+        case ELEMENT_TYPE_I1:           // byte
+        case ELEMENT_TYPE_U1:
+        case ELEMENT_TYPE_I2:           // short
+        case ELEMENT_TYPE_U2:
+        case ELEMENT_TYPE_CHAR:         // char
+        case ELEMENT_TYPE_I4:           // int
+        case ELEMENT_TYPE_U4:
+        case ELEMENT_TYPE_I8:           // long
+        case ELEMENT_TYPE_U8:
+        case ELEMENT_TYPE_R4:           // float
+        case ELEMENT_TYPE_R8:           // double
+        case ELEMENT_TYPE_I:
+        case ELEMENT_TYPE_U:
+        case ELEMENT_TYPE_PTR:
+            if (hasReturnBufferArg)
+            {
+                return (MonoObject*)OBJECTREFToObject(retTH.GetMethodTable()->Box(pRetBufStackCopy));
+            }
+            else
+            {
+                return (MonoObject*)OBJECTREFToObject(retTH.GetMethodTable()->Box(&result));
+            }
+            break;
+        case ELEMENT_TYPE_STRING:
+        case ELEMENT_TYPE_OBJECT:
+        case ELEMENT_TYPE_CLASS:
+        case ELEMENT_TYPE_ARRAY:
+        case ELEMENT_TYPE_SZARRAY:
+        case ELEMENT_TYPE_VAR:
+            return (MonoObject*)OBJECTREFToObject(ArgSlotToObj(result));
+            break;
+        default:
+            assert(false && "This retType is not supported");
+            break;
+    }
+    return nullptr;
+}
+
+extern "C" EXPORT_API void mono_field_set_value(MonoObject *obj, MonoClassField *field, void *value)
+{
+    TRACE_API("%p, %p, %p", obj, field, value);
+
+    // TODO: Add contact
+    // TODO: obj not protected?
+    GCX_COOP();
+    OBJECTREF objectRef = ObjectToOBJECTREF((MonoObject_clr*)obj);
+    auto field_clr = ((MonoClassField_clr*)field);
+    GCPROTECT_BEGIN(objectRef); // Is it really necessary in cooperative mode? for a GetInstanceField?
+    {
+        CorElementType fieldType = field_clr->GetFieldType();
+        if (fieldType == ELEMENT_TYPE_CLASS)
+            field_clr->SetInstanceField(objectRef, &value);
+        else
+            field_clr->SetInstanceField(objectRef, value);
+    }
+    GCPROTECT_END();
+}
+
+extern "C" EXPORT_API void mono_field_get_value(MonoObject *obj, MonoClassField *field, void *value)
+{
+    TRACE_API("%p, %p, %p", obj, field, value);
+
+    // TODO: Add contact
+    // TODO: obj not protected?
+    GCX_COOP();
+    OBJECTREF objectRef = ObjectToOBJECTREF((MonoObject_clr*)obj);
+    GCPROTECT_BEGIN(objectRef); // Is it really necessary in cooperative mode? for a GetInstanceField?
+    {
+        auto field_clr = (MonoClassField_clr*)field;
+        field_clr->GetInstanceField(objectRef, value);
+    }
+    GCPROTECT_END();
+}
+
+extern "C" EXPORT_API int mono_field_get_offset(MonoClassField *field)
+{
+    TRACE_API("%p", field);
+
+    auto field_clr = (MonoClassField_clr*)field;
+    if (field_clr->IsStatic())
+    {
+        return 0;
+    }
+
+    auto result = field_clr->GetOffset();
+    result += sizeof(Object);
+
+    return result;
+}
+
+thread_local ThreadLocalPoolAllocator<ApproxFieldDescIterator,5> g_ApproxFieldDescIteratorAlloc;
+
+extern "C" EXPORT_API MonoClassField* mono_class_get_fields(MonoClass* klass, gpointer *iter)
+{
+    TRACE_API("%p, %p", klass, iter);
+
+    CONTRACTL
+    {
+        THROWS;
+        GC_NOTRIGGER;
+        PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+    if (!iter)
+    {
+        return NULL;
+    }
+    MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
+
+    ApproxFieldDescIterator* iterator = (ApproxFieldDescIterator*)*iter;
+    if (iterator == nullptr)
+    {
+        iterator = g_ApproxFieldDescIteratorAlloc.Alloc();
+        iterator->Init(klass_clr, ApproxFieldDescIterator::INSTANCE_FIELDS | ApproxFieldDescIterator::STATIC_FIELDS);
+        *iter = iterator;
+    }
+
+    auto nextField = iterator->Next();
+    if (nextField == nullptr)
+    {
+        *iter = nullptr;
+        g_ApproxFieldDescIteratorAlloc.Free(iterator);
+        return nullptr;
+    }
+
+    return (MonoClassField*)nextField;
+}
+
+extern "C" EXPORT_API MonoClass* mono_class_get_nested_types(MonoClass* klass, gpointer *iter)
+{
+    TRACE_API("%p, %p", klass, iter);
+
+    CONTRACTL
+    {
+        NOTHROW;
+    GC_NOTRIGGER;
+    PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+    if (!iter)
+    {
+        return NULL;
+    }
+
+    struct NestedTypesIterator
+    {
+        ULONG index;
+        ULONG count;
+        mdTypeDef tokens[];
+    };
+
+    MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
+
+    NestedTypesIterator* nestedIterator = (NestedTypesIterator*)*iter;
+    if (nestedIterator == NULL)
+    {
+        mdTypeDef token = klass_clr->GetCl();
+        IMDInternalImport *pImport = klass_clr->GetMDImport();
+        ULONG nestedCount;
+        pImport->GetCountNestedClasses(token, &nestedCount);
+        // Early exit if there is no nested classes
+        if (nestedCount == 0)
+        {
+            return NULL;
+        }
+        SIZE_T sizeOfIterator = sizeof(NestedTypesIterator) + sizeof(mdTypeDef) * nestedCount;
+        nestedIterator = (NestedTypesIterator*)new BYTE[sizeOfIterator];
+        nestedIterator->index = 0;
+        nestedIterator->count = nestedCount;
+        *iter = nestedIterator;
+        pImport->GetNestedClasses(token, nestedIterator->tokens, nestedCount, &nestedCount);
+    }
+
+    if (nestedIterator->index < nestedIterator->count)
+    {
+        TypeHandle th = ClassLoader::LoadTypeDefThrowing(klass_clr->GetModule(), nestedIterator->tokens[nestedIterator->index]);
+        nestedIterator->index++;
+        MONO_ASSERTE(!th.IsNull());
+        return (MonoClass*)th.GetMethodTable();
+    }
+    else
+    {
+        *iter = NULL;
+        delete[](BYTE*)nestedIterator;
+    }
+
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoMethod* mono_class_get_methods(MonoClass* klass, gpointer *iter)
+{
+    TRACE_API("%p, %p", klass, iter);
+
+    CONTRACTL
+    {
+        THROWS;
+        GC_NOTRIGGER;
+        PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+    if (!iter)
+    {
+        return NULL;
+    }
+
+    MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
+
+    MethodTable::IntroducedMethodIterator* iterator = (MethodTable::IntroducedMethodIterator*)*iter;
+    if (iterator == NULL)
+    {
+        // TODO: Using the option FALSE to iterate methods through a non-canonical type.
+        // Not sure exactly what does this mean
+        iterator = new MethodTable::IntroducedMethodIterator(klass_clr, 0);
+        *iter = iterator;
+    }
+
+    if (!iterator->IsValid())
+    {
+        *iter = NULL;
+        delete iterator;
+        return NULL;
+    }
+
+    auto method = iterator->GetMethodDesc();
+    iterator->Next();
+    return (MonoMethod*)method;
+}
+
+extern "C" EXPORT_API int mono_class_get_userdata_offset()
+{
+    //TRACE_API("", NULL);
+
+    CONTRACTL
+    {
+        NOTHROW;
+    GC_NOTRIGGER;
+    }
+    CONTRACTL_END;
+
+    return offsetof(MethodTable, m_pUserData);
+}
+
+extern "C" EXPORT_API void* mono_class_get_userdata(MonoClass* klass)
+{
+    TRACE_API("%p", klass);
+
+    CONTRACTL
+    {
+        NOTHROW;
+    GC_NOTRIGGER;
+    PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+    return ((MonoClass_clr*)klass)->m_pUserData;
+}
+
+extern "C" EXPORT_API void mono_class_set_userdata(MonoClass* klass, void* userdata)
+{
+    TRACE_API("%p, %p", klass, userdata);
+
+    CONTRACTL
+    {
+        NOTHROW;
+    GC_NOTRIGGER;
+    PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+    ((MonoClass_clr*)klass)->m_pUserData = userdata;
+}
+
+extern "C" EXPORT_API MonoDomain* mono_domain_get()
+{
+    TRACE_API("", NULL);
+    return GetThread() != NULL ? gCurrentDomain : NULL;
+}
+
+extern "C" EXPORT_API MonoDomain* mono_get_root_domain()
+{
+    TRACE_API("", NULL);
+    return gRootDomain;
+}
+
+extern "C" EXPORT_API gint32 mono_domain_get_id(MonoDomain *domain)
+{
+    TRACE_API("", NULL);
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API void mono_assembly_foreach(GFunc func, gpointer user_data)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API void mono_image_close(MonoImage *image)
+{
+    // NOP
+}
+
+extern "C" EXPORT_API void mono_unity_socket_security_enabled_set(gboolean)
+{
+    // NOP
+}
+
+extern "C" EXPORT_API const char* mono_image_get_name(MonoImage *image)
+{
+    TRACE_API("%p", image);
+    CONTRACTL
+    {
+        NOTHROW;
+    GC_NOTRIGGER;
+    PRECONDITION(image != NULL);
+    }
+    CONTRACTL_END;
+
+    return reinterpret_cast<MonoAssembly_clr*>(image)->GetSimpleName();
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_object_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__OBJECT);
+}
+
+#if PLATFORM_WIN || PLATFORM_OSX || PLATFORM_ANDROID || PLATFORM_TIZEN || PLATFORM_STV || PLATFORM_LINUX
+extern "C" EXPORT_API void mono_set_signal_chaining(gboolean)
+{
+    // NOP
+}
+
+#endif
+#if PLATFORM_WIN
+extern "C" EXPORT_API long mono_unity_seh_handler(EXCEPTION_POINTERS*)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return 0;
+}
+
+extern "C" EXPORT_API void mono_unity_set_unhandled_exception_handler(void*)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+#endif
+
+#if !UNITY_XBOXONE
+// Not defined in current mono-consoles,  Nov 25 2013
+extern "C" EXPORT_API void mono_set_commandline_arguments(int, const char* argv[], const char*)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    // TODO (used)
+}
+
+#endif
+
+#if USE_MONO_AOT
+extern "C" EXPORT_API void* mono_aot_get_method(MonoDomain *domain, MonoMethod *method)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+#endif
+//DO_API(MonoMethod*, mono_marshal_get_xappdomain_invoke, (MonoMethod*))
+
+// Type-safe way of looking up methods based on method signatures
+extern "C" EXPORT_API MonoObject* mono_runtime_invoke_array(MonoMethod *method, void *obj, MonoArray *params, MonoException **exc)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API char* mono_array_addr_with_size(MonoArray *array, int size, uintptr_t idx)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+#if PLATFORM_WIN || PLATFORM_XBOXONE
+extern "C" EXPORT_API gunichar2* mono_string_to_utf16(MonoString *string_obj)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+#endif
+
+extern "C" EXPORT_API const char* mono_field_get_name(MonoClassField *field)
+{
+    CONTRACTL
+    {
+        THROWS;
+        GC_NOTRIGGER;
+        MODE_ANY;
+    }
+    CONTRACTL_END
+    auto field_clr = (MonoClassField_clr*)field;
+    return field_clr->GetName();
+}
+
+extern "C" EXPORT_API MonoClass* mono_field_get_parent(MonoClassField *field)
+{
+    FieldDesc* fieldDesc = (FieldDesc*)field;
+    return (MonoClass*)fieldDesc->GetApproxEnclosingMethodTable();
+}
+
+extern "C" EXPORT_API MonoType* mono_field_get_type(MonoClassField *field)
+{
+    CONTRACTL
+    {
+        PRECONDITION(field != NULL);
+    }
+    CONTRACTL_END;
+
+    auto field_clr = (MonoClassField_clr*)field;
+
+    MonoType_clr typeHandle = field_clr->GetFieldTypeHandleThrowing();
+
+    return MonoType_clr_to_MonoType(typeHandle);
+}
+
+extern "C" EXPORT_API MonoType* mono_field_get_type_specific(MonoClassField *field, MonoClass* owner)
+{
+    CONTRACTL
+    {
+        PRECONDITION(field != NULL);
+    }
+    CONTRACTL_END;
+
+    auto field_clr = (MonoClassField_clr*)field;
+    auto klass_clr = (MonoClass_clr*)owner;
+
+    MonoType_clr typeHandle = field_clr->GetExactFieldType(klass_clr);
+
+    return MonoType_clr_to_MonoType(typeHandle);
+}
+
+extern "C" EXPORT_API int mono_type_get_type(MonoType *type)
+{
+    if (type == mono_class_get_type(mono_get_string_class()))
+        return MONO_TYPE_STRING;
+
+    TypeHandle typeHandle = TypeHandle::FromPtr((PTR_VOID)type);
+
+    // TODO: Different behavior than mono
+    // It seems that CLR is collapsing type like
+    // ELEMENT_TYPE_OBJECT into ELEMENT_TYPE_CLASS
+    auto elementType = typeHandle.GetVerifierCorElementType();
+
+    switch(elementType)
+    {
+        case ELEMENT_TYPE_VOID:
+            return MONO_TYPE_VOID;
+        case ELEMENT_TYPE_END:
+            return MONO_TYPE_END;
+        case ELEMENT_TYPE_PTR:
+            return MONO_TYPE_PTR;
+        case ELEMENT_TYPE_BYREF:
+            return MONO_TYPE_BYREF;
+        case ELEMENT_TYPE_STRING:
+            return MONO_TYPE_STRING;
+        case ELEMENT_TYPE_R4:
+            return MONO_TYPE_R4;
+        case ELEMENT_TYPE_R8:
+            return MONO_TYPE_R8;
+        case ELEMENT_TYPE_I8:
+            return MONO_TYPE_I8;
+        case ELEMENT_TYPE_I4:
+            return MONO_TYPE_I4;
+        case ELEMENT_TYPE_I2:
+            return MONO_TYPE_I2;
+        case ELEMENT_TYPE_I1:
+            return MONO_TYPE_I1;
+        case ELEMENT_TYPE_U8:
+            return MONO_TYPE_U8;
+        case ELEMENT_TYPE_U4:
+            return MONO_TYPE_U4;
+        case ELEMENT_TYPE_U2:
+            return MONO_TYPE_U2;
+        case ELEMENT_TYPE_U1:
+            return MONO_TYPE_U1;
+        case ELEMENT_TYPE_CLASS:
+            return MONO_TYPE_CLASS;
+        case ELEMENT_TYPE_BOOLEAN:
+            return MONO_TYPE_BOOLEAN;
+        case ELEMENT_TYPE_CHAR:
+            return MONO_TYPE_CHAR;
+        case ELEMENT_TYPE_VALUETYPE:
+            return MONO_TYPE_VALUETYPE;
+        case ELEMENT_TYPE_VAR:
+            return MONO_TYPE_VAR;
+        case ELEMENT_TYPE_ARRAY:
+            return MONO_TYPE_ARRAY;
+        case ELEMENT_TYPE_GENERICINST:
+            return MONO_TYPE_GENERICINST;
+        case ELEMENT_TYPE_TYPEDBYREF:
+            return MONO_TYPE_TYPEDBYREF;
+        case ELEMENT_TYPE_I:
+            return MONO_TYPE_I;
+        case ELEMENT_TYPE_U:
+            return MONO_TYPE_U;
+        case ELEMENT_TYPE_FNPTR:
+            return MONO_TYPE_FNPTR;
+        case ELEMENT_TYPE_OBJECT:
+            return MONO_TYPE_OBJECT;
+        case ELEMENT_TYPE_SZARRAY:
+            return MONO_TYPE_SZARRAY;
+        case ELEMENT_TYPE_MVAR:
+            return MONO_TYPE_MVAR;
+        case ELEMENT_TYPE_CMOD_REQD:
+            return MONO_TYPE_CMOD_REQD;
+        case ELEMENT_TYPE_CMOD_OPT:
+            return MONO_TYPE_CMOD_OPT;
+        case ELEMENT_TYPE_INTERNAL:
+            return MONO_TYPE_INTERNAL;
+        case ELEMENT_TYPE_MODIFIER:
+            return MONO_TYPE_MODIFIER;
+        case ELEMENT_TYPE_SENTINEL:
+            return MONO_TYPE_SENTINEL;
+        case ELEMENT_TYPE_PINNED:
+            return MONO_TYPE_PINNED;
+        default:
+            return 0;
+    }
+}
+
+extern "C" EXPORT_API const char* mono_method_get_name(MonoMethod *method)
+{
+    return reinterpret_cast<MonoMethod_clr*>(method)->GetName();
+}
+
+extern "C" EXPORT_API char* mono_method_full_name(MonoMethod* method, gboolean signature)
+{
+    auto methodclr = reinterpret_cast<MonoMethod_clr*>(method);
+ 	LPCUTF8 name, namespaze;
+    auto mt = methodclr->GetMethodTable();
+	mt->GetMDImport()->GetNameOfTypeDef(mt->GetCl(), &name, &namespaze);
+
+    InlineSString<256> fullName(SString::Utf8);
+    if (namespaze != NULL)
+    {
+        fullName += InlineSString<256>(SString::Utf8, namespaze);
+        fullName += '.';
+    }
+    fullName += InlineSString<256>(SString::Utf8, name);
+    fullName += ':';
+    fullName +=  InlineSString<256>(SString::Utf8, methodclr->GetName());
+
+    if (signature)
+    {
+        fullName += InlineSString<2>(SString::Utf8, " (");
+            
+        MonoMethodSignature* sig = mono_method_signature(method);
+        gpointer iter = NULL;
+    
+        MonoType *paramType = mono_signature_get_params(sig, &iter);
+        if (paramType)
+        {
+            fullName += InlineSString<256>(SString::Utf8, mono_type_get_name(paramType));
+            while ((paramType = mono_signature_get_params(sig, &iter)))
+            {
+                fullName += ',';
+                fullName += InlineSString<256>(SString::Utf8, mono_type_get_name(paramType));
+            }
+        }
+
+        fullName += ')';
+    }
+    StackScratchBuffer buffer;
+    return _strdup(fullName.GetUTF8(buffer));
+}
+
+extern "C" EXPORT_API MonoImage* mono_assembly_get_image(MonoAssembly *assembly)
+{
+    TRACE_API("%p", assembly);
+    CONTRACTL
+    {
+        NOTHROW;
+        GC_NOTRIGGER;
+        PRECONDITION(assembly != NULL);
+    }
+    CONTRACTL_END;
+
+    // Assume for now that Assembly == Image
+    return (MonoImage*)assembly;
+}
+
+extern "C" EXPORT_API MonoClass* mono_method_get_class(MonoMethod *method)
+{
+    auto method_clr = (MonoMethod_clr*)method;
+    auto class_clr = (MonoClass_clr*)method_clr->GetClass()->GetMethodTable();
+    return (MonoClass*)class_clr;
+}
+
+extern "C" EXPORT_API MonoClass* mono_object_get_class(MonoObject *obj)
+{
+    MonoClass_clr* klass = reinterpret_cast<MonoObject_clr*>(obj)->GetMethodTable();
+    return (MonoClass*)klass;
+}
+
+extern "C" EXPORT_API MonoObject* mono_object_isinst(MonoObject *obj, MonoClass* klass)
+{
+    MonoClass* clazz = mono_object_get_class(obj);
+    if (mono_class_is_subclass_of(clazz, klass, TRUE))
+        return obj;
+    return NULL;
+}
+
+extern "C" EXPORT_API gboolean mono_class_is_valuetype(MonoClass *klass)
+{
+    MonoClass_clr* clazz = (MonoClass_clr*)klass;
+    return (gboolean)clazz->IsValueType()? TRUE : FALSE;
+}
+
+extern "C" EXPORT_API guint32 mono_signature_get_param_count(MonoMethodSignature *sig)
+{
+    MonoMethodSignature_clr* msig = (MonoMethodSignature_clr*)sig;
+    MetaSig metasig(msig);
+    return metasig.NumFixedArgs();
+}
+
+
+extern "C" EXPORT_API char* mono_string_to_utf8(MonoString *string_obj)
+{
+    SString sstr;
+    ((StringObject*)string_obj)->GetSString(sstr);
+    StackScratchBuffer buffer;
+    return _strdup(sstr.GetUTF8(buffer));
+}
+
+extern "C" EXPORT_API MonoString* mono_string_new_wrapper(const char* text)
+{
+    assert(text != nullptr);
+    InlineSString<256> sstr(SString::Utf8, text);
+    GCX_COOP();
+    return (MonoString*)OBJECTREFToObject(AllocateString(sstr));
+}
+
+extern "C" EXPORT_API MonoString* mono_unity_string_empty_wrapper()
+{
+    return mono_string_new_wrapper("");
+}
+
+extern "C" EXPORT_API MonoString* mono_string_new_len(MonoDomain *domain, const char *text, guint32 length)
+{
+    assert(text != nullptr);
+    InlineSString<256> sstr(SString::Utf8, text, length);
+    GCX_COOP();
+    STRINGREF strObj = AllocateString(length);
+    memcpyNoGCRefs(strObj->GetBuffer(), sstr.GetUnicode(), sstr.GetCount() * sizeof(WCHAR));
+    return (MonoString*)OBJECTREFToObject(strObj);
+}
+
+extern "C" EXPORT_API MonoString* mono_string_from_utf16(const gunichar2* text)
+{
+    assert(text != nullptr);
+    InlineSString<256> sstr((const WCHAR*)text);
+    GCX_COOP();
+    return (MonoString*)OBJECTREFToObject(AllocateString(sstr));
+}
+
+extern "C" EXPORT_API MonoClass* mono_class_get_parent(MonoClass *klass)
+{
+    MonoClass_clr* parent = reinterpret_cast<MonoClass_clr*>(klass)->GetParentMethodTable();
+    return (MonoClass*)parent;
+}
+
+extern "C" EXPORT_API const char* mono_class_get_namespace(MonoClass *klass)
+{
+	MonoClass_clr* clazz = (MonoClass_clr*)klass;
+	LPCUTF8 name, namespaze;
+	clazz->GetMDImport()->GetNameOfTypeDef(clazz->GetCl(), &name, &namespaze);
+    return namespaze;
+}
+
+extern "C" EXPORT_API gboolean mono_class_is_subclass_of(MonoClass *klass, MonoClass *klassc, gboolean check_interfaces)
+{
+    MonoClass_clr* clazz = (MonoClass_clr*)klass;
+    MonoClass_clr* clazzc = (MonoClass_clr*)klassc;
+    do
+    {
+        if (clazz == clazzc)
+            return TRUE;
+        if (clazz->IsArray() && clazzc->IsArray())
+        {
+            if (clazz->GetRank() == clazzc->GetRank() && clazz->GetArrayElementTypeHandle() == clazzc->GetArrayElementTypeHandle())
+                return TRUE;
+        }
+        if (check_interfaces)
+        {
+            auto ifaceIter = clazz->IterateInterfaceMap();
+            while (ifaceIter.Next())
+                if (ifaceIter.GetInterfaceApprox() /* JON */ == clazzc)
+                    return TRUE;
+        }
+        clazz = clazz->GetParentMethodTable();
+    }
+    while (clazz != NULL);
+    return FALSE;
+}
+
+extern "C" EXPORT_API const char* mono_class_get_name(MonoClass *klass)
+{
+	MonoClass_clr* clazz = (MonoClass_clr*)klass;
+    if (clazz->IsArray())
+    {
+        const char *elementName = mono_class_get_name(mono_class_get_element_class(klass));
+        int rank = clazz->GetRank();
+        SString arrayName(SString::Utf8, elementName);
+        arrayName += '[';
+        for (int i=0; i<rank-1; i++)
+            arrayName += ',';
+        arrayName += ']';
+        StackScratchBuffer buffer;
+        static char buf[512] = {0};
+        strcpy(buf, arrayName.GetUTF8(buffer));
+        return buf;
+    }
+
+	LPCUTF8 name, namespaze;
+	clazz->GetMDImport()->GetNameOfTypeDef(clazz->GetCl(), &name, &namespaze);
+
+    if (name)
+        return name;
+
+    DefineFullyQualifiedNameForClass();
+    name = GetFullyQualifiedNameForClass(clazz);
+    return name;
+}
+
+extern "C" EXPORT_API int mono_type_get_num_generic_args(MonoType *type)
+{
+    TypeHandle handle = TypeHandle::FromPtr((PTR_VOID)type);
+    Instantiation inst = handle.GetInstantiation();
+    return inst.GetNumArgs();
+}
+
+extern "C" EXPORT_API MonoType* mono_type_get_generic_arg(MonoType *type, int index)
+{
+    TypeHandle handle = TypeHandle::FromPtr((PTR_VOID)type);
+    Instantiation inst = handle.GetInstantiation();
+    return (MonoType*)inst[index].AsPtr();
+}
+
+extern "C" EXPORT_API char* mono_type_get_name(MonoType *type)
+{
+    TypeHandle handle = TypeHandle::FromPtr((PTR_VOID)type);
+    SString ssBuf;
+    handle.GetName(ssBuf);
+    StackScratchBuffer buffer;
+    return _strdup(ssBuf.GetUTF8(buffer));
+}
+
+extern "C" EXPORT_API char* mono_type_get_name_full(MonoType *type, MonoTypeNameFormat format)
+{
+    TRACE_API("%p %d", type, format);
+    if (format != MonoTypeNameFormat::MONO_TYPE_NAME_FORMAT_ASSEMBLY_QUALIFIED)
+    {
+        ASSERT_NOT_IMPLEMENTED;
+        return NULL;
+    }
+
+    TypeHandle handle = TypeHandle::FromPtr((PTR_VOID)type);
+    SString ssBuf;
+    TypeString::AppendType(ssBuf, handle, TypeString::FormatNamespace | TypeString::FormatAssembly | TypeString::FormatFullInst);
+
+    StackScratchBuffer buffer;
+    return _strdup(ssBuf.GetUTF8(buffer));
+}
+
+extern "C" EXPORT_API MonoClass* mono_type_get_class(MonoType *type)
+{
+    TypeHandle handle = TypeHandle::FromPtr((PTR_VOID)type);
+    return (MonoClass*)handle.AsMethodTable();
+}
+
+extern "C" EXPORT_API MonoException * mono_exception_from_name_msg(MonoImage *image, const char *name_space, const char *name, const char *msg)
+{
+    SString sstr(SString::Utf8, msg);
+    GCX_COOP();
+    MonoClass *exclass = mono_class_from_name(image, name_space, name);
+    MonoObject *exobj = mono_object_new(mono_domain_get(), exclass);
+    ((ExceptionObject*)exobj)->SetMessage(AllocateString(sstr));
+    return (MonoException*)exobj;
+}
+
+extern "C" EXPORT_API MonoException * mono_exception_from_name_two_strings(MonoImage *image, const char *name_space, const char *name, const char *msg1, const char *msg2)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoException * mono_get_exception_argument_null(const char *arg)
+{
+    GCX_COOP();
+    SString sarg(SString::Utf8, arg);
+    EEArgumentException* ee = new EEArgumentException(kArgumentNullException, sarg.GetUnicode(), W("ArgumentNull_Generic"));
+    return (MonoException*)OBJECTREFToObject(ee->GetThrowable());
+}
+
+extern "C" EXPORT_API void mono_raise_exception(MonoException *ex)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_exception_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__EXCEPTION);
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_array_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__ARRAY);
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_string_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__STRING);
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_boolean_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__BOOLEAN);
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_byte_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__BYTE);
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_char_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__CHAR);
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_int16_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__INT16);
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_int32_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__INT32);
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_int64_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__INT64);
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_single_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__SINGLE);
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_double_class()
+{
+    return (MonoClass*)CoreLibBinder::GetClass(CLASS__DOUBLE);
+}
+
+extern "C" EXPORT_API MonoArray* mono_array_new(MonoDomain *domain, MonoClass *eclass, guint32 n)
+{
+    CONTRACTL{
+        THROWS;
+        GC_TRIGGERS;
+        PRECONDITION(domain != nullptr);
+        PRECONDITION(eclass != nullptr);
+    } CONTRACTL_END;
+
+    GCX_COOP();
+    // TODO: handle large heap flag?
+    auto arrayRef = AllocateObjectArray(n, (MonoClass_clr*)eclass);
+
+    auto array_clr = (MonoArray_clr*)OBJECTREFToObject(arrayRef);
+    //auto offsetValue = (char*)array_clr->GetDataPtr() - (char*)array_clr;
+    return (MonoArray*)array_clr;
+}
+
+extern "C" EXPORT_API MonoArray* mono_array_new_full(MonoDomain *domain, MonoClass *array_class, guint32 *lengths, guint32 *lower_bounds)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoClass * mono_array_class_get(MonoClass *eclass, guint32 rank)
+{
+    CONTRACTL{
+        STANDARD_VM_CHECK;
+        PRECONDITION(eclass != nullptr);
+        PRECONDITION(rank > 0);
+    } CONTRACTL_END;
+
+    // TODO: We do not make any caching here
+    // Might be a problem compare to mono implem that is caching
+    // (clients might expect that for a same eclass+rank, we get the same array class pointer)
+
+    TypeHandle typeHandle(reinterpret_cast<MonoClass_clr*>(eclass));
+    auto arrayMT = typeHandle.MakeArray(rank);
+
+    return (MonoClass*)arrayMT.GetMethodTable();
+}
+
+extern "C" EXPORT_API gint32 mono_class_array_element_size(MonoClass *ac)
+{
+    CONTRACTL{
+        STANDARD_VM_CHECK;
+        PRECONDITION(ac != nullptr);
+    } CONTRACTL_END;
+    auto ac_clr = (MonoClass_clr*)ac;
+
+    // TODO: Is it really the method to use?
+    DWORD s = ac_clr->IsValueType() ? ac_clr->GetNumInstanceFieldBytes() : sizeof(void*);// ac_clr->GetBaseSize();
+    return s;
+}
+
+extern "C" EXPORT_API MonoObject* mono_type_get_object(MonoDomain *domain, MonoType *type)
+{
+    TypeHandle clrType = TypeHandle::FromPtr(reinterpret_cast<PTR_VOID>(type));
+    GCX_COOP();
+    return (MonoObject*) OBJECTREFToObject(clrType.GetManagedClassObject());
+}
+
+extern "C" EXPORT_API gboolean mono_class_is_generic(MonoClass* klass)
+{
+    CONTRACTL{
+        PRECONDITION(klass != nullptr);
+    } CONTRACTL_END;
+    MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
+    return klass_clr->IsGenericTypeDefinition() ? TRUE : FALSE;
+}
+
+extern "C" EXPORT_API gboolean mono_class_is_inflated(MonoClass* klass)
+{
+    CONTRACTL{
+        PRECONDITION(klass != nullptr);
+    } CONTRACTL_END;
+    MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
+    // TODO: is it really the concept behind inflated? (generic instance?)
+    auto isgeneric = klass_clr->GetNumGenericArgs() > 0
+        && !klass_clr->IsGenericTypeDefinition();
+
+    return isgeneric ? TRUE : FALSE;
+}
+
+#if !USE_CONSOLEBRANCH_MONO
+extern "C" EXPORT_API gboolean unity_mono_method_is_generic(MonoMethod* method)
+{
+    CONTRACTL{
+        PRECONDITION(method != nullptr);
+    } CONTRACTL_END;
+    auto method_clr = (MonoMethod_clr*)method;
+
+    return method_clr->IsGenericMethodDefinition() ? TRUE : FALSE;
+}
+
+extern "C" EXPORT_API gboolean unity_mono_method_is_inflated(MonoMethod* method)
+{
+    CONTRACTL{
+        PRECONDITION(method != nullptr);
+    } CONTRACTL_END;
+    auto method_clr = (MonoMethod_clr*)method;
+    // TODO: is it really the concept behind inflated? (generic instance?)
+    auto isgeneric = method_clr->GetNumGenericMethodArgs() > 0
+        && !method_clr->IsGenericMethodDefinition();
+
+    return isgeneric ? TRUE : FALSE;
+}
+
+#endif
+
+extern "C" EXPORT_API MonoThread * mono_thread_attach(MonoDomain *domain)
+{
+    auto domain_clr = (MonoDomain_clr*)domain;
+    MonoThread_clr* currentThread = GetThread();
+
+    if (currentThread == nullptr)
+    {
+        currentThread = SetupThreadNoThrow();
+    }
+
+    assert(currentThread != nullptr);
+    //assert(domain_clr->CanThreadEnter(currentThread));
+    gCurrentDomain = domain;
+
+    return (MonoThread*)currentThread;
+}
+
+extern "C" EXPORT_API void mono_thread_detach(MonoThread *thread)
+{
+    CONTRACTL{
+        PRECONDITION(thread != nullptr);
+    } CONTRACTL_END;
+    auto thread_clr = (MonoThread_clr*)thread;
+    gCurrentDomain = NULL;
+    // TODO: FALSE or TRUE there?
+    thread_clr->DetachThread(FALSE);
+}
+
+// mono_thread_attach/mono_thread_detach does a full managed thread setup each time.
+// This is too slow for wrapping it around any managed job. So, in the "fast" versions,
+// we don't actually bother with detaching and attaching the thread at all. However,
+// we need to make sure we leave GC in preemptive modewhen detaching, so the thread
+// can be suspended by the GC at any point.
+extern "C" EXPORT_API void mono_unity_thread_fast_attach (MonoDomain * domain)
+{
+    gCurrentDomain = domain;
+}
+
+extern "C" EXPORT_API void mono_unity_thread_fast_detach ()
+{
+    gCurrentDomain = NULL;
+    GetThread()->EnablePreemptiveGC();
+}
+
+extern "C" EXPORT_API MonoThread * mono_thread_exit()
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoThread * mono_thread_current(void)
+{
+    return (MonoThread*)GetThread();
+}
+
+extern "C" EXPORT_API void mono_thread_set_main(MonoThread* thread)
+{
+    CONTRACTL{
+        PRECONDITION(thread != nullptr);
+    } CONTRACTL_END;
+    auto thread_clr = (MonoThread_clr*)thread;
+    // almost NOP
+    //assert(AppDomain::GetCurrentDomain()->CanThreadEnter(thread_clr));
+}
+
+extern "C" EXPORT_API void
+mono_set_find_plugin_callback (gconstpointer find)
+{
+	unity_find_plugin_callback = (UnityFindPluginCallback)find;
+}
+
+extern "C" EXPORT_API void mono_runtime_unhandled_exception_policy_set(MonoRuntimeUnhandledExceptionPolicy policy)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    /* JON
+    switch (policy)
+    {
+        case MONO_UNHANDLED_POLICY_LEGACY:
+            GetEEPolicy()->SetUnhandledExceptionPolicy(eHostDeterminedPolicy);
+            break;
+        case MONO_UNHANDLED_POLICY_CURRENT:
+            GetEEPolicy()->SetUnhandledExceptionPolicy(eRuntimeDeterminedPolicy);
+            break;
+        default:
+            ASSERT_NOT_IMPLEMENTED;
+    }*/
+}
+
+extern "C" EXPORT_API MonoClass* mono_class_get_nesting_type(MonoClass *klass)
+{
+    MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
+    if (!klass_clr->GetClass()->IsNested())
+    {
+        return nullptr;
+    }
+    MonoClass_clr* ret = ClassLoader::LoadTypeDefOrRefOrSpecThrowing(klass_clr->GetModule(), klass_clr->GetEnclosingCl(), NULL, ClassLoader::ThrowIfNotFound, ClassLoader::PermitUninstDefOrRef).AsMethodTable();
+    return (MonoClass*)ret;
+}
+
+extern "C" EXPORT_API MonoVTable* mono_class_vtable(MonoDomain *domain, MonoClass *klass)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoReflectionMethod* mono_method_get_object(MonoDomain *domain, MonoMethod *method, MonoClass *refclass)
+{
+    GCX_COOP();
+
+    MonoMethod_clr* clrMethod = reinterpret_cast<MonoMethod_clr*>(method);
+
+    REFLECTMETHODREF refRet = clrMethod->GetStubMethodInfo();
+    _ASSERTE(clrMethod->IsRuntimeMethodHandle());
+    MonoObject* stubMethodInfo = (MonoObject*)OBJECTREFToObject(refRet);
+    MonoClass* runtimeType = (MonoClass*)ClassLoader::LoadTypeByNameThrowing(CoreLibBinder::GetModule()->GetAssembly(), "System", "RuntimeType").AsMethodTable();
+    MonoMethod* getmethodbase = mono_class_get_method_from_name(runtimeType, "GetMethodBase", 1);
+    void* params[1] = { stubMethodInfo };
+    MonoObject* returnValue = mono_runtime_invoke(getmethodbase, nullptr, params, nullptr);
+    return (MonoReflectionMethod*)returnValue;
+}
+
+extern "C" EXPORT_API MonoMethodSignature* mono_method_signature(MonoMethod *method)
+{
+    return (MonoMethodSignature*)method;
+}
+
+extern "C" EXPORT_API MonoMethodSignature* mono_method_signature_checked (MonoMethod * method, MonoError * error)
+{
+    return (MonoMethodSignature*)method;
+}
+
+extern "C" EXPORT_API MonoType* mono_signature_get_params(MonoMethodSignature *sig, gpointer *iter)
+{
+    MonoMethodSignature_clr* signature = (MonoMethodSignature_clr*)sig;
+    MetaSig* metasig = (MetaSig*)*iter;
+    if (metasig == NULL)
+    {
+        metasig = new MetaSig(signature);
+        *iter = metasig;
+    }
+
+    CorElementType argType = metasig->NextArg();
+    if (argType == ELEMENT_TYPE_END)
+    {
+        delete metasig;
+        //*iter = NULL; // match mono behavior
+        return NULL;
+    }
+
+    TypeHandle typeHandle = metasig->GetLastTypeHandleThrowing();
+    return (MonoType*)typeHandle.AsPtr();
+}
+
+extern "C" EXPORT_API MonoType* mono_signature_get_return_type(MonoMethodSignature *sig)
+{
+    MonoMethodSignature_clr* signature = (MonoMethodSignature_clr*)sig;
+    MetaSig msig(signature);
+    TypeHandle reth = msig.GetRetTypeHandleThrowing();
+    return (MonoType*)reth.AsPtr();
+}
+
+extern "C" EXPORT_API MonoType* mono_class_get_type(MonoClass *klass)
+{
+    TypeHandle h(reinterpret_cast<MonoClass_clr*>(klass));
+    return (MonoType*)h.AsPtr();
+}
+
+#if !UNITY_XBOXONE
+// Not defined in current mono-consoles,  Nov 25 2013
+extern "C" EXPORT_API void mono_set_ignore_version_and_key_when_finding_assemblies_already_loaded(gboolean value)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+#endif
+extern "C" EXPORT_API void mono_debug_init(int format)
+{
+    // NOP
+}
+
+#if !USE_CONSOLEBRANCH_MONO
+extern "C" EXPORT_API gboolean mono_is_debugger_attached(void)
+{
+    return FALSE;
+}
+#endif
+
+extern "C" EXPORT_API void mono_debug_open_image_from_memory(MonoImage *image, const char *raw_contents, int size)
+{
+    // NOP
+}
+
+extern "C" EXPORT_API guint32 mono_field_get_flags(MonoClassField *field)
+{
+    return ((FieldDesc*)field)->GetAttributes();
+}
+
+extern "C" EXPORT_API MonoImage* mono_image_open_from_data_full(const void *data, guint32 data_len, gboolean need_copy, int *status, gboolean ref_only)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoImage* mono_image_open_from_data_with_name(char *data, guint32 data_len, gboolean need_copy, int *status, gboolean refonly, const char *name)
+{
+    TRACE_API("%p, %d, %d, %p, %d, %s", data, data_len, need_copy, status, refonly, name);
+
+    GCX_COOP();
+
+    gint64 len = data_len;
+    void* params[2] = { data, &len };
+    auto assemblyObject = (AssemblyBaseObject*)mono_runtime_invoke(gALCWrapperLoadFromAssemblyDataMethod, GetMonoDomainObject(mono_domain_get()), params, NULL);
+    if (assemblyObject == NULL)
+        return NULL;
+
+    assemblyObject->GetDomainAssembly()->SetCustomPath(name);
+
+    auto assembly = assemblyObject->GetAssembly();
+    assembly->EnsureActive();
+
+    if (g_LoadedImages == NULL)
+        g_LoadedImages = new SArray<LoadedImage>;
+    g_LoadedImages->Append(LoadedImage(name, (MonoImage*)assembly, mono_domain_get()));
+
+    return (MonoImage*)assembly;
+}
+
+extern "C" EXPORT_API MonoImage* mono_image_loaded(const char *name)
+{
+    if (g_LoadedImages == NULL)
+        g_LoadedImages = new SArray<LoadedImage>;
+    for (COUNT_T i=0; i<g_LoadedImages->GetCount(); i++)
+    {
+        if (strcmp((*g_LoadedImages)[i].name, name) == 0)
+            return (*g_LoadedImages)[i].image;
+    }
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoAssembly * mono_assembly_load_from(MonoImage *image, const char*fname, int *status)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API gboolean mono_assembly_fill_assembly_name(MonoImage *image, MonoAssemblyName *aname)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return FALSE;
+}
+
+extern "C" EXPORT_API char* mono_stringify_assembly_name(MonoAssemblyName *aname)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API int mono_assembly_name_parse(const char* name, MonoAssemblyName *assembly)
+{
+    assembly->name = _strdup(name);
+    return 1;
+}
+
+extern "C" EXPORT_API void mono_assembly_name_free (MonoAssemblyName * assembly)
+{
+    free((void*)assembly->name);
+    assembly->name = NULL;
+}
+
+extern "C" EXPORT_API MonoAssembly* mono_assembly_loaded(MonoAssemblyName *aname)
+{
+    TRACE_API("%p", aname);
+
+    AppDomain::AssemblyIterator assemblyIterator = SystemDomain::GetCurrentDomain()->IterateAssembliesEx((AssemblyIterationFlags)(
+            kIncludeExecution | kIncludeLoaded | kIncludeCollected));
+
+    CollectibleAssemblyHolder<DomainAssembly *> pDomainAssembly;
+    while (assemblyIterator.Next(pDomainAssembly.This()))
+    {
+        auto simpleName = pDomainAssembly->GetSimpleName();
+        if (strcmp(simpleName, aname->name) == 0)
+        {
+            return (MonoAssembly*)pDomainAssembly->GetAssembly();
+        }
+    }
+    return NULL;
+}
+
+extern "C" EXPORT_API int mono_image_get_table_rows(MonoImage *image, int table_id)
+{
+    if (table_id == MONO_TABLE_TYPEDEF)
+    {
+        DomainAssembly* domainAssembly = reinterpret_cast<MonoImage_clr*>(image)->GetDomainAssembly();
+        return domainAssembly->GetModule()->GetNumTypeDefs() - 1;
+    }
+
+
+    ASSERT_NOT_IMPLEMENTED;
+    return 0;
+}
+
+extern "C" EXPORT_API MonoClass* mono_class_get(MonoImage *image, guint32 type_token)
+{
+    TRACE_API("%p, %x", image, type_token);
+
+    DomainAssembly* domainAssembly = reinterpret_cast<MonoImage_clr*>(image)->GetDomainAssembly();
+    MonoClass_clr* klass = ClassLoader::LoadTypeDefOrRefOrSpecThrowing(domainAssembly->GetModule(), (mdToken)type_token, NULL).AsMethodTable();
+    return (MonoClass*)klass;
+}
+
+extern "C" EXPORT_API gboolean mono_metadata_signature_equal(MonoMethodSignature *sig1, MonoMethodSignature *sig2)
+{
+    if (mono_signature_get_param_count(sig1) != mono_signature_get_param_count(sig2))
+        return FALSE;
+    if (mono_signature_get_return_type(sig1) != mono_signature_get_return_type(sig2))
+        return FALSE;
+    if (mono_signature_is_instance(sig1) != mono_signature_is_instance(sig2))
+        return FALSE;
+
+    gpointer iter1 = NULL;
+    gpointer iter2 = NULL;
+    bool match = true;
+    while (MonoType *paramType1 = mono_signature_get_params(sig1, &iter1))
+    {
+        MonoType *paramType2 = mono_signature_get_params(sig2, &iter2);
+        if (paramType1 != paramType2)
+            match = false;
+    }
+    return match;
+}
+
+extern "C" EXPORT_API MonoObject * mono_value_box(MonoDomain *domain, MonoClass *klass, gpointer val)
+{
+    GCX_COOP();
+
+    TRACE_API("%p, %p, %p", domain, klass, val);
+
+    MonoClass_clr* classClr = (MonoClass_clr*)klass;
+
+    return (MonoObject*)OBJECTREFToObject(classClr->Box(val));
+}
+
+extern "C" EXPORT_API MonoImage* mono_class_get_image(MonoClass *klass)
+{
+    MonoClass_clr* classClr = (MonoClass_clr*)klass;
+
+    return (MonoImage*)classClr->GetAssembly();
+}
+
+extern "C" EXPORT_API char mono_signature_is_instance(MonoMethodSignature *sig)
+{
+    MonoMethodSignature_clr* sig_clr = (MonoMethodSignature_clr*)sig;
+    MetaSig msig(sig_clr);
+    return msig.HasThis();
+}
+
+extern "C" EXPORT_API MonoMethod* mono_method_get_last_managed()
+{
+    return (MonoMethod*)(intptr_t)g_isManaged;
+}
+
+extern "C" EXPORT_API MonoClass* mono_get_enum_class()
+{
+    MonoImage* img = mono_get_corlib();
+    return mono_class_from_name(img, "System", "Enum");
+}
+
+extern "C" EXPORT_API MonoType* mono_class_get_byref_type(MonoClass *klass)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API gboolean mono_type_is_byref (MonoType * type)
+{
+    TypeHandle clrType = TypeHandle::FromPtr(reinterpret_cast<PTR_VOID>(type));
+    return clrType.IsByRef();
+}
+
+extern "C" EXPORT_API void mono_field_static_get_value(MonoVTable *vt, MonoClassField *field, void *value)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API void mono_unity_set_embeddinghostname(const char* name)
+{
+    // NOP
+}
+
+extern "C" EXPORT_API void mono_set_assemblies_path(const char* name)
+{
+    strcpy(s_AssemblyPaths, name);
+}
+
+
+guint32 handleId = 0;
+struct MonoHandleInfo
+{
+    MonoHandleInfo() : Handle(nullptr), Type((HandleType)-1)
+    {
+    }
+    MonoHandleInfo(const MonoHandleInfo& copy) : Handle(copy.Handle), Type(copy.Type)
+    {
+    }
+    OBJECTHANDLE Handle;
+    HandleType Type;
+};
+MapSHashWithRemove<guint32, MonoHandleInfo> g_gc_map_id_to_handle;
+
+extern "C" EXPORT_API guint32 mono_gchandle_new(MonoObject *obj, gboolean pinned)
+{
+    TRACE_API("%p, %d", obj, pinned);
+    CONTRACTL
+    {
+        PRECONDITION(obj != NULL);
+    }
+    CONTRACTL_END;
+
+    GCX_COOP();
+    // TODO: This method is not accurate with Cooperative/Preemptive mode
+
+    // NOTE
+    // mono is using a guint32 to identify an GCHandle
+    // while coreclr is using a OBJECTHANDLE which is a pointer
+    // so we are maintaining a map here between an generated identifier
+    // and the OBJECTHANDLE
+    //CrstHolder lock(&g_gc_handles_lock);
+
+    auto objref = ObjectToOBJECTREF((MonoObject_clr*)obj);
+    OBJECTHANDLE rawHandle = pinned ?
+        GetAppDomain()->CreatePinningHandle(objref) :
+        GetAppDomain()->CreateHandle(objref);
+    MonoHandleInfo objhandle;
+    objhandle.Handle = rawHandle;
+    objhandle.Type = pinned ? HNDTYPE_PINNED : HNDTYPE_DEFAULT;
+
+    auto id = ++handleId;
+    g_gc_map_id_to_handle.Add(id, objhandle);
+
+    return id;
+}
+
+extern "C" EXPORT_API void mono_gchandle_free(guint32 gchandle)
+{
+    //CrstHolder lock(&g_gc_handles_lock);
+
+    MonoHandleInfo handle;
+    if (g_gc_map_id_to_handle.Lookup(gchandle, &handle))
+    {
+        DestroyHandleCommon(handle.Handle, handle.Type);
+        g_gc_map_id_to_handle.Remove(gchandle);
+    }
+}
+
+
+extern "C" EXPORT_API MonoObject* mono_gchandle_get_target(guint32 gchandle)
+{
+    GCX_COOP();
+    // TODO: This method is not accurate with Cooperative/Preemptive mode
+
+    CrstHolder lock(&g_gc_handles_lock);
+
+    MonoHandleInfo handle;
+    if (g_gc_map_id_to_handle.Lookup(gchandle, &handle))
+    {
+        OBJECTREF objref = ObjectFromHandle(handle.Handle);
+        return (MonoObject*)OBJECTREFToObject(objref);
+    }
+
+    // throw an error?
+    return NULL;
+}
+
+extern "C" EXPORT_API guint32 mono_gchandle_new_weakref(MonoObject *obj, gboolean track_resurrection)
+{
+    CONTRACTL
+    {
+        PRECONDITION(obj != NULL);
+    }
+    CONTRACTL_END;
+
+    GCX_COOP();
+    // TODO: This method is not accurate with Cooperative/Preemptive mode
+
+    // NOTE
+    // mono is using a guint32 to identify an GCHandle
+    // while coreclr is using a OBJECTHANDLE which is a pointer
+    // so we are maintaining a map here between an generated identifier
+    // and the OBJECTHANDLE
+    //CrstHolder lock(&g_gc_handles_lock);
+
+    auto objref = ObjectToOBJECTREF((MonoObject_clr*)obj);
+    OBJECTHANDLE rawHandle = track_resurrection ?
+        GetAppDomain()->CreateLongWeakHandle(objref) :
+        GetAppDomain()->CreateShortWeakHandle(objref);
+
+    MonoHandleInfo objhandle;
+    objhandle.Handle = rawHandle;
+    objhandle.Type = track_resurrection ? HNDTYPE_WEAK_LONG : HNDTYPE_WEAK_SHORT;
+
+    auto id = ++handleId;
+    g_gc_map_id_to_handle.Add(id, objhandle);
+
+    return id;
+}
+
+extern "C" EXPORT_API gboolean mono_gchandle_is_in_domain(guint32 gchandle, MonoDomain *domain)
+{
+    // we only support one domain, so this should always be true.
+    return true;
+}
+
+extern "C" EXPORT_API MonoObject* mono_assembly_get_object(MonoDomain *domain, MonoAssembly *assembly)
+{
+    FCALL_CONTRACT;
+    GCX_COOP();
+    return (MonoObject*)OBJECTREFToObject(reinterpret_cast<MonoImage_clr*>(assembly)->GetExposedObject());
+}
+
+typedef gboolean(*MonoStackWalk) (MonoMethod *method, gint32 native_offset, gint32 il_offset, gboolean managed, gpointer data);
+extern "C" EXPORT_API void mono_stack_walk(MonoStackWalk func, gpointer user_data)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API char* mono_pmip(void *ip)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoObject* mono_runtime_delegate_invoke(MonoObject *delegate, void **params, MonoException **exc)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoJitInfo* mono_jit_info_table_find(MonoDomain* domain, void* ip)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoDebugSourceLocation* mono_debug_lookup_source_location(MonoMethod* method, guint32 address, MonoDomain* domain)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API void mono_debug_free_source_location(MonoDebugSourceLocation* location)
+{
+}
+
+//DO_API (void,GC_free,(void* p))
+//DO_API(void*,GC_malloc_uncollectable,(int size))
+extern "C" EXPORT_API MonoProperty* mono_class_get_properties(MonoClass* klass, gpointer *iter)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoMethod* mono_property_get_get_method(MonoProperty *prop)
+{
+    return (MonoMethod*)prop;
+}
+
+extern "C" EXPORT_API MonoObject * mono_object_new_alloc_specific(MonoVTable *vtable)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoObject * mono_object_new_specific(MonoVTable *vtable)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API void mono_gc_collect(int generation)
+{
+    FCALL_CONTRACT;
+    _ASSERTE(generation >= -1);
+    GCX_COOP();
+    if (mono_unity_gc_is_disabled())
+        return;
+    GCHeapUtilities::GetGCHeap()->GarbageCollect(generation, false, collection_blocking);
+}
+
+extern "C" EXPORT_API int mono_gc_max_generation()
+{
+    FCALL_CONTRACT;
+    return GCHeapUtilities::GetGCHeap()->GetMaxGeneration();
+}
+
+extern "C" EXPORT_API gint64 mono_gc_get_used_size()
+{
+    FCALL_CONTRACT;
+    return GCHeapUtilities::GetGCHeap()->GetTotalBytesInUse();
+}
+
+extern "C" EXPORT_API gint64 mono_gc_get_heap_size()
+{
+    FCALL_CONTRACT;
+    // NOT CORRECT
+    return GCHeapUtilities::GetGCHeap()->GetTotalBytesInUse();
+}
+
+extern "C" EXPORT_API void mono_gc_wbarrier_generic_store(gpointer ptr, MonoObject* value)
+{
+}
+
+extern "C" EXPORT_API MonoAssembly* mono_image_get_assembly(MonoImage *image)
+{
+    return (MonoAssembly*)image;
+}
+
+extern "C" EXPORT_API MonoAssembly* mono_assembly_open(const char *filename, int *status)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API gboolean mono_class_is_enum(MonoClass *klass)
+{
+    return (gboolean)reinterpret_cast<MonoClass_clr*>(klass)->IsEnum() ? TRUE : FALSE;
+}
+
+extern "C" EXPORT_API MonoType* mono_class_enum_basetype(MonoClass *klass)
+{
+        CONTRACTL
+    {
+        NOTHROW;
+    GC_NOTRIGGER;
+    PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+
+    CorElementType type = reinterpret_cast<MonoClass_clr*>(klass)->GetInternalCorElementType();
+    switch(type)
+    {
+    case ELEMENT_TYPE_CHAR:
+        return mono_class_get_type(mono_get_char_class());
+    case ELEMENT_TYPE_U1:
+        return mono_class_get_type(mono_get_byte_class());
+    case ELEMENT_TYPE_I2:
+        return mono_class_get_type(mono_get_int16_class());
+    case ELEMENT_TYPE_I4:
+        return mono_class_get_type(mono_get_int32_class());
+    case ELEMENT_TYPE_U4:
+        return mono_class_get_type((MonoClass*)CoreLibBinder::GetClass(CLASS__UINT32));
+    case ELEMENT_TYPE_I8:
+        return mono_class_get_type(mono_get_int64_class());
+    default:
+        printf("mono_class_enum_basetype: Element type %x not implemented!\n", type);
+        return NULL;
+    }
+}
+
+extern "C" EXPORT_API gint32 mono_class_instance_size(MonoClass *klass)
+{
+    return (guint32)reinterpret_cast<MonoClass_clr*>(klass)->GetNumInstanceFieldBytes() + sizeof(void*);
+}
+
+extern "C" EXPORT_API guint32 mono_object_get_size(MonoObject *obj)
+{
+    return (guint32)reinterpret_cast<MonoObject_clr*>(obj)->GetSize();
+}
+
+extern "C" EXPORT_API guint32 mono_class_get_type_token(MonoClass *klass)
+{
+    return (guint32)reinterpret_cast<MonoClass_clr*>(klass)->GetTypeID();
+}
+
+extern "C" EXPORT_API const char* mono_image_get_filename(MonoImage *image)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoAssembly* mono_assembly_load_from_full(MonoImage *image, const char *fname, int *status, gboolean refonly)
+{
+    // TODO: As we are making MonoImage == MonoAssembly, return it as-is
+    return (MonoAssembly*)image;
+}
+
+extern "C" EXPORT_API MonoClass* mono_class_get_interfaces(MonoClass* klass, gpointer *iter)
+{
+    TRACE_API("%p, %p", klass, iter);
+
+    CONTRACTL
+    {
+        THROWS;
+        GC_NOTRIGGER;
+        PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+    if (!iter)
+    {
+        return NULL;
+    }
+    MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
+
+    MethodTable::InterfaceMapIterator* iterator = (MethodTable::InterfaceMapIterator*)*iter;
+    if (iterator == nullptr)
+    {
+        iterator = /*new MethodTable::InterfaceMapIterator(klass_clr); JON FIXME */ &klass_clr->IterateInterfaceMap();
+        *iter = iterator;
+    }
+
+    if (!iterator->Next())
+    {
+        *iter = nullptr;
+        delete iterator;
+        return nullptr;
+    }
+
+    /*return (MonoClass*)iterator->GetInterface(); JON*/
+    return (MonoClass*)iterator->GetInterfaceApprox();
+}
+
+extern "C" EXPORT_API void mono_assembly_close(MonoAssembly *assembly)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API MonoProperty* mono_class_get_property_from_name(MonoClass *klass, const char *name)
+{
+    // CoreCLR does not have easy support for iterating on properties on a MethodTable.
+    // So instead, we look for the property's "get" method. This will not work for set-only 
+    // properties, but is sufficient for our needs for now.
+    SString propertyName(SString::Utf8, "get_");
+    propertyName += SString(SString::Utf8, name);
+    StackScratchBuffer buffer;
+    return (MonoProperty*)mono_class_get_method_from_name(klass, propertyName.GetUTF8(buffer), 0);
+}
+
+extern "C" EXPORT_API MonoMethod* mono_class_get_method_from_name(MonoClass *klass, const char *name, int param_count)
+{
+    CONTRACTL
+    {
+        THROWS;
+        GC_TRIGGERS;
+        PRECONDITION(klass != NULL);
+        PRECONDITION(name != NULL);
+    }
+    CONTRACTL_END;
+
+    MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
+
+    // TODO: Check if there is an API to perform this more efficiently
+    while (klass_clr)
+    {
+        auto iterator = MethodTable::MethodIterator(klass_clr);
+        while (iterator.IsValid())
+        {
+            auto method = iterator.GetMethodDesc();
+
+            if (strcmp(method->GetName(), name) == 0)
+            {
+                MetaSig     methodSig(method);
+
+                DWORD numArgs = methodSig.NumFixedArgs();
+                if (numArgs == param_count)
+                {
+                    return (MonoMethod*)method;
+                }
+            }
+            iterator.Next();
+        }
+        klass_clr = klass_clr->GetParentMethodTable();  
+    }
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoClass* mono_class_from_mono_type(MonoType *image)
+{
+    MonoClass_clr* klass = MonoType_clr_from_MonoType(image).GetMethodTable();
+    return (MonoClass*)klass;
+}
+
+extern "C" EXPORT_API int mono_class_get_rank(MonoClass *klass)
+{
+    CONTRACTL
+    {
+        NOTHROW;
+    GC_NOTRIGGER;
+    PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+
+    MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
+    return klass_clr->IsArray() ? klass_clr->GetRank() : 0;
+}
+
+extern "C" EXPORT_API MonoClass* mono_class_get_element_class(MonoClass *klass)
+{
+    CONTRACTL
+    {
+        NOTHROW;
+    GC_NOTRIGGER;
+    PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+    return (MonoClass*)reinterpret_cast<MonoClass_clr*>(klass)->GetArrayElementTypeHandle().GetMethodTable();
+}
+
+extern "C" EXPORT_API gboolean mono_unity_class_is_interface(MonoClass* klass)
+{
+    CONTRACTL
+    {
+        NOTHROW;
+    GC_NOTRIGGER;
+    PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+    return reinterpret_cast<MonoClass_clr*>(klass)->IsInterface() ? TRUE : FALSE;
+}
+
+extern "C" EXPORT_API gboolean mono_unity_class_is_abstract(MonoClass* klass)
+{
+    CONTRACTL
+    {
+        NOTHROW;
+    GC_NOTRIGGER;
+    PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+    return reinterpret_cast<MonoClass_clr*>(klass)->IsAbstract() ? TRUE : FALSE;
+}
+
+extern "C" EXPORT_API int mono_array_element_size(MonoClass* classOfArray)
+{
+    CONTRACTL
+    {
+        NOTHROW;
+        GC_NOTRIGGER;
+        PRECONDITION(classOfArray != NULL);
+    }
+    CONTRACTL_END;
+
+    return reinterpret_cast<MonoClass_clr*>(classOfArray)->GetArrayElementTypeHandle().GetSize();
+}
+
+extern "C" EXPORT_API gboolean mono_domain_set(MonoDomain *domain, gboolean force)
+{
+    gCurrentDomain = domain;
+    return true;
+}
+
+extern "C" EXPORT_API void mono_thread_push_appdomain_ref(MonoDomain *domain)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API void mono_thread_pop_appdomain_ref()
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API int mono_runtime_exec_main(MonoMethod *method, MonoArray *args, MonoObject **exc)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoImage* mono_get_corlib()
+{
+    return (MonoImage*)CoreLibBinder::GetModule()->GetDomainAssembly()->GetAssembly();
+}
+
+extern "C" EXPORT_API MonoClassField* mono_class_get_field_from_name(MonoClass *klass, const char *name)
+{
+    CONTRACTL
+    {
+    GC_NOTRIGGER;
+    PRECONDITION(klass != NULL);
+    }
+    CONTRACTL_END;
+
+    MonoClass_clr* mt = reinterpret_cast<MonoClass_clr*>(klass);
+
+    ApproxFieldDescIterator fieldDescIterator(mt, ApproxFieldDescIterator::ALL_FIELDS);
+    FieldDesc* pField;
+
+    while ((pField = fieldDescIterator.Next()) != NULL)
+    {
+        if(strcmp(pField->GetName(), name) == 0)
+        {
+            return (MonoClassField*)pField;
+        }
+    }
+
+    return NULL;
+}
+
+extern "C" EXPORT_API guint32 mono_class_get_flags(MonoClass *klass)
+{
+    MonoClass_clr* clrClass = reinterpret_cast<MonoClass_clr*>(klass);
+    mdTypeDef token = clrClass->GetCl();
+    IMDInternalImport *pImport = clrClass->GetMDImport();
+    DWORD           dwClassAttrs;
+    pImport->GetTypeDefProps(token, &dwClassAttrs, NULL);
+    return dwClassAttrs;
+}
+
+extern "C" EXPORT_API int mono_parse_default_optimizations(const char* p)
+{
+    // NOP
+    return 0;
+}
+
+extern "C" EXPORT_API void mono_set_defaults(int verbose_level, guint32 opts)
+{
+    // NOP
+}
+
+extern "C" EXPORT_API void mono_config_parse(const char *filename)
+{
+    // NOP
+}
+
+extern "C" EXPORT_API void mono_set_dirs(const char *assembly_dir, const char *config_dir)
+{
+    strcpy(s_AssemblyDir, assembly_dir);
+    strcpy(s_EtcDir, assembly_dir);
+}
+
+//DO_API(void,ves_icall_System_AppDomain_InternalUnload,(int domain_id))
+//DO_API(MonoObject*,ves_icall_System_AppDomain_createDomain,(MonoString *friendly_name, MonoObject *setup))
+
+#if !UNITY_XBOXONE
+// Not defined in current mono-consoles,  June 2 2015
+extern "C" EXPORT_API void mono_set_break_policy(MonoBreakPolicyFunc policy_callback)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+#endif
+
+extern "C" EXPORT_API void mono_jit_parse_options(int argc, char * argv[])
+{
+}
+
+extern "C" EXPORT_API gpointer mono_object_unbox(MonoObject* o)
+{
+    CONTRACTL
+    {
+        NOTHROW;
+    GC_NOTRIGGER;
+    PRECONDITION(o != NULL);
+    }
+    CONTRACTL_END;
+
+    return (gpointer)reinterpret_cast<MonoObject_clr*>(o)-> UnBox();
+}
+
+MonoObject* CreateAttributeInstance(MonoCustomAttrInfo_clr* attributes, mdCustomAttribute mdAttribute, MonoClass *attr_klass)
+{
+    mdToken tkCtor;
+    if (attributes->import->GetCustomAttributeProps(mdAttribute, &tkCtor) != S_OK)
+        return NULL;
+
+    if (attr_klass == NULL)
+    {
+        if (TypeFromToken(tkCtor) == mdtMemberRef || TypeFromToken(tkCtor) == mdtMethodDef)
+        {
+            mdToken tkType;
+            if (attributes->import->GetParentToken(tkCtor, &tkType) == S_OK)
+            {
+                if (TypeFromToken(tkType) == mdtTypeRef || TypeFromToken(tkType) == mdtTypeDef)
+                {
+                    DomainAssembly* domainAssembly = attributes->assembly->GetDomainAssembly();
+                    attr_klass = (MonoClass*)ClassLoader::LoadTypeDefOrRefThrowing(domainAssembly->GetModule(), tkType,
+                                                                    ClassLoader::ReturnNullIfNotFound,
+                                                                    ClassLoader::PermitUninstDefOrRef,
+                                                                    tdNoTypes).AsMethodTable();
+                }
+            }
+        }
+    }
+
+    MonoObject* obj = mono_object_new(mono_domain_get(), attr_klass);
+
+    DomainAssembly* domainAssembly = attributes->assembly->GetDomainAssembly();
+
+    MethodDesc* ctorMethod;
+    if (TypeFromToken(tkCtor) == mdtMemberRef)
+    {
+        MethodDesc * pMD = NULL;
+        FieldDesc * pFD = NULL;
+        TypeHandle th;
+        MemberLoader::GetDescFromMemberRef(domainAssembly->GetModule(), tkCtor, &ctorMethod, &pFD, NULL, FALSE, &th);
+    }
+    else
+        ctorMethod = domainAssembly->GetModule()->LookupMethodDef(tkCtor);
+
+    const BYTE  *pbAttr;                // Custom attribute data as a BYTE*.
+    ULONG       cbAttr;                 // Size of custom attribute data.
+
+    if (attributes->import->GetCustomAttributeAsBlob(mdAttribute, (const void**)&pbAttr, &cbAttr) != S_OK)
+        return NULL;
+
+    CustomAttributeParser CA(pbAttr, cbAttr);
+    CA.ValidateProlog();
+
+    GCX_COOP();
+
+    MetaSig     methodSig(ctorMethod);
+    DWORD numArgs = methodSig.NumFixedArgs();
+    ArgIterator argIt(&methodSig);
+
+    const int MAX_ARG_SLOT = 128;
+    ARG_SLOT argslots[MAX_ARG_SLOT];
+    DWORD slotIndex = 0;
+    argslots[0] = PtrToArgSlot(obj);
+    slotIndex++;
+
+    for (DWORD argIndex = 0; argIndex < numArgs; argIndex++, slotIndex++)
+    {
+        int ofs = argIt.GetNextOffset();
+        _ASSERTE(ofs != TransitionBlock::InvalidOffset);
+        auto stackSize = argIt.GetArgSize();
+
+        auto argTH = methodSig.GetLastTypeHandleNT();
+        auto argType = argTH.GetInternalCorElementType();
+
+        switch (argType)
+        {
+        case ELEMENT_TYPE_I1:
+        case ELEMENT_TYPE_U1:
+        case ELEMENT_TYPE_BOOLEAN:
+            {
+                UINT8 u1 = 0;
+                CA.GetU1(&u1);
+                argslots[slotIndex] = u1;
+                break;
+            }
+
+        case ELEMENT_TYPE_I2:
+        case ELEMENT_TYPE_U2:
+            {
+                UINT16 u2 = 0;
+                CA.GetU2(&u2);
+                argslots[slotIndex] = u2;
+                break;
+            }        
+        case ELEMENT_TYPE_I4:
+        case ELEMENT_TYPE_U4:
+            {
+                UINT32 u4 = 0;
+                CA.GetU4(&u4);
+                argslots[slotIndex] = u4;
+                break;
+            }          
+        case ELEMENT_TYPE_I8:
+        case ELEMENT_TYPE_U8:
+            {
+                UINT64 u8 = 0;
+                CA.GetU8(&u8);
+                argslots[slotIndex] = u8;
+                break;
+            }          
+        case ELEMENT_TYPE_R4:
+            {
+                float f = CA.GetR4();
+                argslots[slotIndex] = *(INT32*)(&f);
+                break;
+            }           
+        case ELEMENT_TYPE_R8:
+            {
+                double d = CA.GetR8();
+                argslots[slotIndex] = *(INT64*)(&d);
+                break;
+            }          
+        case ELEMENT_TYPE_CLASS:
+        case ELEMENT_TYPE_STRING:
+            {
+                ULONG cbVal;
+                LPCUTF8 pStr;
+                CA.GetString(&pStr, &cbVal);
+                argslots[slotIndex] = ObjToArgSlot(ObjectToOBJECTREF((Object*)mono_string_new_len(mono_domain_get(), pStr, cbVal)));
+                break;
+            }
+        default:
+            assert(false && "This argType is not supported");
+            break;
+        }
+    }
+
+    g_isManaged++;
+    EX_TRY
+    {
+        OBJECTREF objref = ObjectToOBJECTREF((Object*)obj);
+        MethodDescCallSite invoker(ctorMethod, &objref);
+        invoker.Call_RetArgSlot(argslots);
+    }
+    EX_CATCH
+    {
+        SString sstr;
+        GET_EXCEPTION()->GetMessage(sstr);
+        StackScratchBuffer buffer;
+        printf("Exc: %s %d %x\n", sstr.GetUTF8(buffer), GET_EXCEPTION()->IsType(CLRException::GetType()), GET_EXCEPTION()->GetInstanceType());
+    }
+    EX_END_CATCH(SwallowAllExceptions)
+    g_isManaged--;
+
+    methodSig.Reset();
+
+    return obj;
+}
+
+extern "C" EXPORT_API MonoObject* mono_custom_attrs_get_attr(MonoCustomAttrInfo *ainfo, MonoClass *requested_klass)
+{
+    TRACE_API("%p, %p", ainfo, attr_klass);
+    MonoCustomAttrInfo_clr* attributes = reinterpret_cast<MonoCustomAttrInfo_clr*>(ainfo);
+
+    HENUMInternal iterator;
+    if (attributes->import->EnumInit(mdtCustomAttribute, attributes->mdDef, &iterator) != S_OK)
+        return NULL;
+
+    mdCustomAttribute mdAttribute;
+    while (attributes->import->EnumNext(&iterator, &mdAttribute))    
+    {
+        mdToken tkCtor;
+        if (attributes->import->GetCustomAttributeProps(mdAttribute, &tkCtor) == S_OK)
+        {
+            if (TypeFromToken(tkCtor) == mdtMemberRef || TypeFromToken(tkCtor) == mdtMethodDef)
+            {
+                mdToken tkType;
+                if (attributes->import->GetParentToken(tkCtor, &tkType) == S_OK)
+                {
+                    if (TypeFromToken(tkType) == mdtTypeRef || TypeFromToken(tkType) == mdtTypeDef)
+                    {
+                        DomainAssembly* domainAssembly = attributes->assembly->GetDomainAssembly();
+                        auto attr_klass = (MonoClass*)ClassLoader::LoadTypeDefOrRefThrowing(domainAssembly->GetModule(), tkType,
+                                                                        ClassLoader::ReturnNullIfNotFound,
+                                                                        ClassLoader::PermitUninstDefOrRef,
+                                                                        tdNoTypes).AsMethodTable();
+
+                        if (mono_class_is_subclass_of(attr_klass, requested_klass, false))                                                                    
+                            return CreateAttributeInstance(attributes, mdAttribute, attr_klass);
+                    }
+                }
+            }
+        }
+    }    
+
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoArray* mono_custom_attrs_construct(MonoCustomAttrInfo *ainfo)
+{
+    MonoCustomAttrInfo_clr* attributes = reinterpret_cast<MonoCustomAttrInfo_clr*>(ainfo);
+    HENUMInternal iterator;
+    if (attributes->import->EnumInit(mdtCustomAttribute, attributes->mdDef, &iterator) != S_OK)
+        return NULL;
+
+    auto count = attributes->import->EnumGetCount(&iterator);
+
+    auto array = mono_array_new(mono_domain_get(), mono_get_object_class(), count);
+
+    mdCustomAttribute mdAttribute;
+    int arrayIndex = 0;
+    while (attributes->import->EnumNext(&iterator, &mdAttribute))
+        ((MonoObject**)((ArrayBase*)array)->GetDataPtr())[arrayIndex++] = CreateAttributeInstance(attributes, mdAttribute, NULL);
+
+    return (MonoArray*)array;
+}
+
+extern "C" EXPORT_API gboolean mono_custom_attrs_has_attr(MonoCustomAttrInfo *ainfo, MonoClass *attr_klass)
+{
+    TRACE_API("%p, %p", ainfo, attr_klass);
+    MonoCustomAttrInfo_clr* attributes = reinterpret_cast<MonoCustomAttrInfo_clr*>(ainfo);
+    MonoClass_clr* attributeClass = reinterpret_cast<MonoClass_clr*>(attr_klass);
+
+// Reference implementation. This is about 3x slower, but will likely work for any type of attribute representation,
+// so if the optimized version below is suspected to not work correctly, try this one:
+/*
+    LPCUTF8 name, namespaze;
+	attributeClass->GetMDImport()->GetNameOfTypeDef(attributeClass->GetCl(), &name, &namespaze);
+
+    InlineSString<512> fullTypeName(SString::Utf8, namespaze);
+    fullTypeName.AppendUTF8(".");
+    fullTypeName.AppendUTF8(name);
+
+    return S_OK == attributes->import->GetCustomAttributeByName(attributes->mdDef, fullTypeName.GetUTF8NoConvert(), NULL, NULL) ? TRUE : FALSE;
+*/
+
+    HENUMInternal iterator;
+    if (attributes->import->EnumInit(mdtCustomAttribute, attributes->mdDef, &iterator) != S_OK)
+        return false;
+
+    mdCustomAttribute mdAttribute;
+    bool found = false;
+    while (attributes->import->EnumNext(&iterator, &mdAttribute))
+    {
+        mdToken tkCtor;
+        if (attributes->import->GetCustomAttributeProps(mdAttribute, &tkCtor) == S_OK)
+        {
+            if (TypeFromToken(tkCtor) == mdtMemberRef || TypeFromToken(tkCtor) == mdtMethodDef)
+            {
+                mdToken tkType;
+                if (attributes->import->GetParentToken(tkCtor, &tkType) == S_OK)
+                {
+                    if (TypeFromToken(tkType) == mdtTypeDef)
+                    {
+                        if (tkType == attributeClass->GetCl())
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    else if (TypeFromToken(tkType) == mdtTypeRef)
+                    {
+                        DomainAssembly* domainAssembly = attributes->assembly->GetDomainAssembly();
+                        MonoClass_clr* klass = ClassLoader::LoadTypeDefOrRefThrowing(domainAssembly->GetModule(), tkType,
+                                                                        ClassLoader::ReturnNullIfNotFound,
+                                                                        ClassLoader::PermitUninstDefOrRef,
+                                                                        tdNoTypes).AsMethodTable();
+                        if (klass == attributeClass)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    attributes->import->EnumClose(&iterator);   
+    return found;
+}
+
+extern "C" EXPORT_API MonoClass* mono_custom_attrs_get_attrs (MonoCustomAttrInfo * ainfo, void** iterator)
+{
+    TRACE_API("%p, %p", ainfo, iterator);
+
+    MonoCustomAttrInfo_clr* attributes = reinterpret_cast<MonoCustomAttrInfo_clr*>(ainfo);
+    if (*iterator == NULL)
+    {
+        *iterator = new HENUMInternal();
+        if (attributes->import->EnumInit(mdtCustomAttribute, attributes->mdDef, (HENUMInternal*)*iterator) != S_OK)
+            return NULL;
+    }
+
+    mdCustomAttribute mdAttribute;
+    while (attributes->import->EnumNext((HENUMInternal*)*iterator, &mdAttribute))
+    {
+        mdToken tkCtor;
+        if (attributes->import->GetCustomAttributeProps(mdAttribute, &tkCtor) == S_OK)
+        {
+            if (TypeFromToken(tkCtor) == mdtMemberRef || TypeFromToken(tkCtor) == mdtMethodDef)
+            {
+                mdToken tkType;
+                if (attributes->import->GetParentToken(tkCtor, &tkType) == S_OK)
+                {
+                    if (TypeFromToken(tkType) == mdtTypeRef || TypeFromToken(tkType) == mdtTypeDef)
+                    {
+                        DomainAssembly* domainAssembly = attributes->assembly->GetDomainAssembly();
+                        MonoClass_clr* klass = ClassLoader::LoadTypeDefOrRefThrowing(domainAssembly->GetModule(), tkType,
+                                                                        ClassLoader::ReturnNullIfNotFound,
+                                                                        ClassLoader::PermitUninstDefOrRef,
+                                                                        tdNoTypes).AsMethodTable();
+                        if (klass != NULL)
+                            return (MonoClass*)klass;
+                    }
+                }
+            }
+        }
+    }
+
+    attributes->import->EnumClose((HENUMInternal*)*iterator);
+    delete (HENUMInternal*)*iterator;
+    return NULL;
+}
+
+thread_local ThreadLocalPoolAllocator<MonoCustomAttrInfo_clr,5> g_AttributeInfoAlloc;
+
+extern "C" EXPORT_API MonoCustomAttrInfo* mono_custom_attrs_from_field(MonoClass *klass, MonoClassField *field)
+{
+    TRACE_API("%p, %p", klass, field);
+    FieldDesc* clrFieldDesc = reinterpret_cast<FieldDesc*>(field);
+    MonoCustomAttrInfo_clr *aInfo = g_AttributeInfoAlloc.Alloc();
+    aInfo->import = clrFieldDesc->GetMDImport();
+    aInfo->mdDef = clrFieldDesc->GetMemberDef();
+    aInfo->assembly = clrFieldDesc->GetApproxEnclosingMethodTable_NoLogging()->GetAssembly();
+    return (MonoCustomAttrInfo*)aInfo;
+}
+
+extern "C" EXPORT_API MonoCustomAttrInfo* mono_custom_attrs_from_method(MonoMethod *method)
+{
+    TRACE_API("%p", method);
+    MonoMethod_clr* clrMethod = reinterpret_cast<MonoMethod_clr*>(method);
+    MonoCustomAttrInfo_clr *aInfo = g_AttributeInfoAlloc.Alloc();
+    aInfo->import = clrMethod->GetMDImport();
+    aInfo->mdDef = clrMethod->GetMemberDef();
+    aInfo->assembly = clrMethod->GetAssembly();
+    return (MonoCustomAttrInfo*)aInfo;
+}
+
+extern "C" EXPORT_API MonoCustomAttrInfo* mono_custom_attrs_from_class(MonoClass *klass)
+{
+    TRACE_API("%p", klass);
+    MonoClass_clr* clrClass = reinterpret_cast<MonoClass_clr*>(klass);
+    MonoCustomAttrInfo_clr *aInfo = g_AttributeInfoAlloc.Alloc();
+    aInfo->import = clrClass->GetMDImport();
+    aInfo->mdDef = clrClass->GetCl();
+    aInfo->assembly = clrClass->GetAssembly();
+    return (MonoCustomAttrInfo*)aInfo;
+}
+
+extern "C" EXPORT_API MonoCustomAttrInfo* mono_custom_attrs_from_assembly(MonoAssembly *assembly)
+{
+    TRACE_API("%p", assembly);
+    MonoCustomAttrInfo_clr *aInfo = g_AttributeInfoAlloc.Alloc();
+    auto clrAssembly = (MonoImage_clr*)assembly;
+    aInfo->import = clrAssembly->GetManifestImport();
+    aInfo->mdDef = clrAssembly->GetManifestToken();
+    aInfo->assembly = clrAssembly;
+    return (MonoCustomAttrInfo*)aInfo;
+}
+
+extern "C" EXPORT_API MonoArray* mono_reflection_get_custom_attrs_by_type(MonoObject* object, MonoClass* klass)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API void mono_custom_attrs_free(MonoCustomAttrInfo* attr)
+{
+    g_AttributeInfoAlloc.Free((MonoCustomAttrInfo_clr*)attr);
+}
+
+extern "C" EXPORT_API void* mono_loader_get_last_error(void)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoException* mono_loader_error_prepare_exception(void *error)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+#if UNITY_STANDALONE || UNITY_EDITOR
+// DllImport fallback handling to load native libraries from custom locations
+typedef void* (*MonoDlFallbackLoad) (const char *name, int flags, char **err, void *user_data);
+typedef void* (*MonoDlFallbackSymbol) (void *handle, const char *name, char **err, void *user_data);
+typedef void* (*MonoDlFallbackClose) (void *handle, void *user_data);
+
+#	if !UNITY_XBOXONE
+// Not defined in current mono-consoles,  Nov 25 2013
+extern "C" EXPORT_API MonoDlFallbackHandler* mono_dl_fallback_register(MonoDlFallbackLoad load_func, MonoDlFallbackSymbol symbol_func, MonoDlFallbackClose close_func, void *user_data)
+{
+    return NULL;
+}
+
+extern "C" EXPORT_API void mono_dl_fallback_unregister(MonoDlFallbackHandler *handler)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+#	endif
+
+#endif
+
+typedef void(*vprintf_func)(const char* msg, va_list args);
+extern "C" EXPORT_API void mono_unity_set_vprintf_func(vprintf_func func)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API void* mono_unity_liveness_allocate_struct(MonoClass* filter, int max_object_count, mono_register_object_callback callback, void* userdata)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API void mono_unity_liveness_stop_gc_world()
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API void mono_unity_liveness_finalize(void* state)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API void mono_unity_liveness_start_gc_world()
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API void mono_unity_liveness_free_struct(void* state)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+#if USE_CONSOLEBRANCH_MONO
+extern "C" EXPORT_API void* mono_unity_liveness_calculation_begin(MonoClass * filter, int max_object_count, mono_register_object_callback callback, void* userdata)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+#else
+extern "C" EXPORT_API void* mono_unity_liveness_calculation_begin(MonoClass * filter, int max_object_count, mono_register_object_callback callback, void* userdata, mono_liveness_world_state_callback world_started_callback, mono_liveness_world_state_callback world_stopped_callback)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+#endif
+
+extern "C" EXPORT_API void mono_unity_liveness_calculation_end(void* state)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API void mono_unity_liveness_calculation_from_root(MonoObject* root, void* state)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API void mono_unity_liveness_calculation_from_statics(void* state)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API MonoMethod* unity_mono_reflection_method_get_method(MonoReflectionMethod* mrf)
+{
+    return (MonoMethod*)((ReflectMethodObject*)mrf)->GetMethod();
+}
+
+///@TODO add this as an optimization when upgrading mono, used by MonoStringNewLength:
+/// mono_string_new_len      (MonoDomain *domain, const char *text, guint length);
+
+// Profiler
+#if ENABLE_MONO_MEMORY_PROFILER
+typedef void(*MonoProfileFunc) (void *prof);
+typedef void(*MonoProfileMethodFunc)   (void *prof, MonoMethod   *method);
+typedef void(*MonoProfileExceptionFunc) (void *prof, MonoObject *object);
+typedef void(*MonoProfileExceptionClauseFunc) (void *prof, MonoMethod *method, int clause_type, int clause_num);
+typedef void(*MonoProfileGCFunc)         (void *prof, int event, int generation);
+typedef void(*MonoProfileGCResizeFunc)   (void *prof, SInt64 new_size);
+typedef void(*MonoProfileAllocFunc)      (void *prof, MonoObject* obj, MonoClass* klass);
+typedef void(*MonoProfileStatCallChainFunc) (void *prof, int call_chain_depth, guchar **ip, void *context);
+typedef void(*MonoProfileStatFunc)       (void *prof, guchar *ip, void *context);
+typedef void(*MonoProfileJitResult)    (void *prof, MonoMethod *method, void* jinfo, int result);
+typedef void(*MonoProfileThreadFunc)     (void *prof, unsigned long tid);
+
+extern "C" EXPORT_API void mono_profiler_install(void *prof, MonoProfileFunc shutdown_callback)
+{
+    // NOP
+}
+
+extern "C" EXPORT_API void mono_profiler_set_events(int events)
+{
+    // NOP
+}
+
+extern "C" EXPORT_API void mono_profiler_install_enter_leave(MonoProfileMethodFunc enter, MonoProfileMethodFunc fleave)
+{
+    // NOP
+}
+
+MonoProfileGCFunc gc_func = NULL;
+
+extern "C" EXPORT_API void mono_profiler_install_gc(MonoProfileGCFunc callback, MonoProfileGCResizeFunc heap_resize_callback)
+{
+    gc_func = callback;
+}
+
+extern "C" EXPORT_API void mono_profiler_install_allocation(MonoProfileAllocFunc callback)
+{
+    // NOP
+}
+
+extern "C" EXPORT_API void mono_profiler_install_jit_end(MonoProfileJitResult jit_end)
+{
+    // NOP
+}
+
+extern "C" EXPORT_API void mono_profiler_install_thread(MonoProfileThreadFunc start, MonoProfileThreadFunc end)
+{
+    // NOP
+}
+
+//DO_API(void, mono_gc_base_init, ())
+//DO_API(void, mono_profiler_install_statistical, (MonoProfileStatFunc callback))
+//DO_API(void, mono_profiler_install_statistical_call_chain, (MonoProfileStatCallChainFunc callback, int call_chain_depth))
+extern "C" EXPORT_API void mono_profiler_install_exception(MonoProfileExceptionFunc throw_callback, MonoProfileMethodFunc exc_method_leave, MonoProfileExceptionClauseFunc clause_callback)
+{
+    // NOP
+}
+
+#endif
+
+#if UNITY_IPHONE || UNITY_TVOS
+extern "C" EXPORT_API void mono_aot_register_module(void *aot_info)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+#endif
+
+extern "C" EXPORT_API void mono_unity_g_free(void* p)
+{
+    free(p);
+}
+
+/*
+#if UNITY_ANDROID
+static inline char   *g_strdup (const char *str) { if (str) {return strdup (str);} return NULL; }
+#define g_mem_set_vtable(x)
+#else
+extern "C" EXPORT_API char* g_strdup(const char *image)
+{
+}
+
+extern "C" EXPORT_API void g_mem_set_vtable(gpointer vtable)
+{
+}
+
+#endif*/
+
+//DO_API(void,macosx_register_exception_handler,())
+
+extern "C" EXPORT_API void mono_trace_set_level_string(const char *value)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API void mono_trace_set_mask_string(const char *value)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+#if UNITY_OSX
+extern "C" EXPORT_API int mono_backtrace_from_context(void* context, void* array[], int count)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+#endif
+
+#if ENABLE_MONO_MEMORY_CALLBACKS
+extern "C" EXPORT_API void unity_mono_install_memory_callbacks(MonoMemoryCallbacks* callbacks)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+#endif
+
+extern "C" EXPORT_API void mono_gc_mark_stack_slot(void* objRef)
+{
+    pCurrentThreadNativeFrame->PushStackPtr((void**)objRef);
+}
+
+extern "C" EXPORT_API void mono_gc_unmark_stack_slot(void* objRef)
+{
+    pCurrentThreadNativeFrame->PopStackPtr((void**)objRef);
+}
+
+extern "C" EXPORT_API void mono_unity_jit_cleanup(MonoDomain *domain)
+{
+    mono_jit_cleanup(domain);
+}
+
+extern "C" EXPORT_API gboolean mono_class_is_blittable(MonoClass * klass)
+{
+    MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
+    return klass_clr->IsBlittable();
+}
+
+extern "C" EXPORT_API MonoArray* mono_unity_array_new_2d(MonoDomain * domain, MonoClass * eclass, size_t size0, size_t size1)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoArray* mono_unity_array_new_3d(MonoDomain * domain, MonoClass * eclass, size_t size0, size_t size1, size_t size2)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API MonoClass* mono_unity_class_get(MonoImage * image, guint32 type_token)
+{
+    DomainAssembly* domainAssembly = reinterpret_cast<MonoImage_clr*>(image)->GetDomainAssembly();
+    TypeHandle th = domainAssembly->GetModule()->LookupTypeDef(type_token);
+    if (th.IsNull())
+        th = domainAssembly->GetModule()->LookupFullyCanonicalInstantiation(type_token);
+    if (th.IsNull())
+    {
+        return (MonoClass*)ClassLoader::LoadTypeDefOrRefThrowing(domainAssembly->GetModule(), type_token,
+            ClassLoader::ReturnNullIfNotFound,
+            ClassLoader::PermitUninstDefOrRef,
+            tdNoTypes).AsMethodTable();
+
+    }
+    return (MonoClass*)th.AsMethodTable();
+}
+
+extern "C" EXPORT_API void mono_unity_domain_set_config(MonoDomain * domain, const char *base_dir, const char *config_file_name)
+{
+    // NOP
+}
+extern "C" EXPORT_API MonoException* mono_unity_loader_get_last_error_and_error_prepare_exception()
+{
+    //ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API void mono_unity_runtime_set_main_args(int, const char* argv[])
+{
+    // NOP
+}
+
+extern "C" EXPORT_API void mono_gc_wbarrier_set_field (MonoObject * obj, gpointer field_ptr, MonoObject * value)
+{
+    GCX_COOP();
+    
+    SetObjectReference((OBJECTREF*)field_ptr, ObjectToOBJECTREF((MonoObject_clr*)value));
+}
+
+extern "C" EXPORT_API void mono_set_assemblies_path_null_separated (const char* name)
+{
+    char *assemblyPaths = s_AssemblyPaths;
+    while (*name != NULL)
+    {
+        size_t l = strlen(name);
+        strcpy(assemblyPaths, name);
+        assemblyPaths[l] = PATH_SEPARATOR;
+        assemblyPaths += l;
+        name += l+1;
+        if (*name != NULL)
+            assemblyPaths++;
+    }
+    *assemblyPaths = NULL;
+}
+
+extern "C" EXPORT_API gint64 mono_gc_get_max_time_slice_ns ()
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return 0;
+}
+
+extern "C" EXPORT_API void mono_gc_set_max_time_slice_ns (gint64 maxTimeSlice)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API gboolean mono_gc_is_incremental ()
+{
+    return false;
+}
+
+extern "C" EXPORT_API void mono_gc_set_incremental (gboolean value)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API int mono_gc_collect_a_little ()
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return 0;
+}
+
+extern "C" EXPORT_API void mono_unity_set_data_dir (const char * dir)
+{
+}
+
+extern "C" EXPORT_API MonoManagedMemorySnapshot* mono_unity_capture_memory_snapshot ()
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API void mono_unity_free_captured_memory_snapshot (MonoManagedMemorySnapshot * snapshot)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+int gc_disabled = 0;
+
+extern "C" EXPORT_API void mono_unity_gc_disable ()
+{
+    TRACE_API("", NULL);
+
+    FCALL_CONTRACT;
+    GCX_COOP();
+    if (gc_disabled == 0)
+        GCHeapUtilities::GetGCHeap()->StartNoGCRegion(16*1024*1024, false, 0, true);
+    gc_disabled++;
+}
+
+extern "C" EXPORT_API void mono_unity_gc_enable ()
+{
+    TRACE_API("", NULL);
+
+    FCALL_CONTRACT;
+    GCX_COOP();
+    if (gc_disabled == 1)
+        GCHeapUtilities::GetGCHeap()->EndNoGCRegion();
+    gc_disabled--;
+}
+
+extern "C" EXPORT_API int mono_unity_gc_is_disabled ()
+{
+    return gc_disabled != 0;
+}
+
+typedef void(*MonoUnityExceptionFunc) (MonoObject* exc);
+struct MonoMethodDesc;
+typedef void (*MonoDebuggerAttachFunc)(gboolean attached);
+
+extern "C" EXPORT_API void mono_debugger_set_generate_debug_info (gboolean enable)
+{
+}
+
+extern "C" EXPORT_API void mono_debugger_install_attach_detach_callback (MonoDebuggerAttachFunc func)
+{
+}
+
+extern "C" EXPORT_API gint32 mono_error_ok (MonoError * error)
+{
+    return true;
+}
+
+extern "C" EXPORT_API void mono_error_init (MonoError * error)
+{
+
+}
+
+extern "C" EXPORT_API MonoClass* mono_unity_class_get_generic_type_definition (MonoClass * klass)
+{
+    CONTRACTL{
+        PRECONDITION(klass != nullptr);
+    } CONTRACTL_END;
+    // there must be a better way!
+    return mono_class_from_name(mono_class_get_image(klass), mono_class_get_namespace(klass), mono_class_get_name(klass));
+}
+
+extern "C" EXPORT_API void mono_unity_register_path_remapper (RemapPathFunction func)
+{
+    register_path_remapper(func);
+}
+
+#define DO_API(ret,name,sig) extern "C" EXPORT_API ret name sig { ASSERT_NOT_IMPLEMENTED; }
+#define DO_API_RET(ret,name,sig) extern "C" EXPORT_API ret name sig { ASSERT_NOT_IMPLEMENTED; return 0; }
+
+DO_API_RET(guint32, mono_type_get_attrs, (MonoType * type))
+DO_API_RET(MonoString*, mono_string_new_utf16, (MonoDomain * domain, const guint16 * text, gint32 length))
+DO_API_RET(gboolean, mono_metadata_type_equal, (MonoType * t1, MonoType * t2))
+DO_API(void, mono_stack_walk_no_il, (MonoStackWalk start, void* user_data));
+DO_API_RET(MonoCustomAttrInfo*, mono_custom_attrs_from_property, (MonoClass * klass, MonoProperty * property))
+DO_API(void, mono_unity_image_set_mempool_chunk_foreach, (MonoDataFunc callback, void* userdata))
+DO_API(void, mono_unity_root_domain_mempool_chunk_foreach, (MonoDataFunc callback, void* userdata))
+DO_API(void, mono_unity_gc_heap_foreach, (MonoDataFunc callback, void* userData))
+DO_API(void, mono_unity_gc_handles_foreach_get_target, (MonoDataFunc callback, void* userData))
+DO_API_RET(uint32_t, mono_unity_object_header_size, ())
+DO_API_RET(uint32_t, mono_unity_array_object_header_size, ())
+DO_API_RET(uint32_t, mono_unity_offset_of_array_length_in_array_object_header, ())
+DO_API_RET(uint32_t, mono_unity_offset_of_array_bounds_in_array_object_header, ())
+DO_API_RET(uint32_t, mono_unity_allocation_granularity, ())
+DO_API_RET(uint32_t, mono_unity_class_get_data_size, (MonoClass * klass))
+DO_API(void, mono_unity_type_get_name_full_chunked, (MonoType * type, MonoDataFunc appendCallback, void* userData))
+DO_API_RET(MonoVTable*, mono_unity_class_try_get_vtable, (MonoDomain * domain, MonoClass * klass))
+DO_API_RET(gboolean, mono_unity_type_is_pointer_type, (MonoType * type))
+DO_API_RET(gboolean, mono_unity_type_is_static, (MonoType * type))
+DO_API_RET(gboolean, mono_unity_class_field_is_literal, (MonoClassField * field))
+DO_API_RET(void*, mono_unity_vtable_get_static_field_data, (MonoVTable * vTable))
+DO_API(void, mono_unity_class_for_each, (MonoClassFunc callback, void* userData))
+DO_API(void, mono_unity_stop_gc_world, ())
+DO_API(void, mono_unity_start_gc_world, ())
+DO_API(void, mono_trace_set_log_handler, (MonoLogCallback callback, void *user_data))
+DO_API(void, mono_unity_domain_mempool_chunk_foreach, (MonoDomain * domain, MonoDataFunc callback, void* userData))
+DO_API(void, mono_unity_assembly_mempool_chunk_foreach, (MonoAssembly * assembly, MonoDataFunc callback, void* userData))
+DO_API_RET(MonoMethodDesc*, mono_method_desc_new, (const char *name, gboolean include_namespace))
+DO_API_RET(MonoMethod*, mono_method_desc_search_in_class, (MonoMethodDesc * desc, MonoClass * klass))
+DO_API(void, mono_method_desc_free, (MonoMethodDesc * desc))
+DO_API_RET(gboolean, mono_type_generic_inst_is_valuetype, (MonoType*))
+DO_API_RET(gboolean, mono_debugger_get_generate_debug_info, ())
+DO_API(void, mono_debugger_disconnect, ())
+DO_API(void, mono_error_cleanup, (MonoError * error))
+DO_API_RET(unsigned short, mono_error_get_error_code, (MonoError * error))
+DO_API_RET(const char*, mono_error_get_message, (MonoError * error))
+
+
+extern "C" EXPORT_API void* mono_profiler_create (MonoProfiler * prof)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+
+extern "C" EXPORT_API void mono_profiler_load (const char *desc)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+
+extern "C" EXPORT_API void mono_set_crash_chaining (gboolean)
+{
+}
+
+#if PLATFORM_OSX
+extern "C" EXPORT_API int mono_unity_backtrace_from_context(void* context, void* array[], int count)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return 0;
+}
+#endif
+
+void fire_mono_gc_suspend_callback()
+{
+    if (gc_func)
+        gc_func(NULL, 6, 0);
+}
+
+void fire_mono_gc_resume_callback()
+{
+    if (gc_func)
+        gc_func(NULL, 9, 0);
+}

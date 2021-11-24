@@ -55,9 +55,14 @@ namespace
                 pfwalk->m_placement.m_offset = ulOffset;
                 pfwalk->m_sequence = (ULONG)-1;
 
+#if FEATURE_UNITY_EMBEDDING_INTERFACE
+            // Unity: This code seems to cause double-compensation for the parent offset, as we already adjust
+            // for this in dwInstanceSliceOffset in MethodTableBuilder::HandleExplicitLayout. So commenting it out.
+#else
                 // Treat base class as an initial member.
                 if (!SafeAddUINT32(&(pfwalk->m_placement.m_offset), cbAdjustedParentLayoutNativeSize))
                     COMPlusThrowOM();
+#endif
             }
         }
         IfFailThrow(hr);

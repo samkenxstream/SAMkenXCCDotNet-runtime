@@ -52,6 +52,7 @@ set(UTILCODE_COMMON_SOURCES
   winfix.cpp
   longfilepathwrappers.cpp
   yieldprocessornormalized.cpp
+  procaddressoverride.cpp
 )
 
 # These source file do not yet compile on Linux.
