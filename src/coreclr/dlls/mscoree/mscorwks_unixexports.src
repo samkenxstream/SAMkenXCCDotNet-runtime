@@ -24,7 +24,6 @@ mono_domain_finalize
 mono_runtime_cleanup
 mono_object_get_virtual_method
 mono_verifier_set_mode
-mono_security_set_mode
 mono_add_internal_call
 mono_unity_jit_cleanup
 mono_jit_init
@@ -57,7 +56,6 @@ mono_image_close
 mono_unity_socket_security_enabled_set
 mono_image_get_name
 mono_get_object_class
-mono_set_signal_chaining
 mono_unity_runtime_set_main_args
 mono_runtime_invoke_array
 mono_array_addr_with_size

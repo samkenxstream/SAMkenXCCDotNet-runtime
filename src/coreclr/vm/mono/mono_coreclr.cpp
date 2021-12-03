@@ -469,7 +469,7 @@ extern "C" EXPORT_API MonoDomain* mono_jit_init_version(const char *file, const 
             return nullptr;
         }*/
 
-        DWORD error = PAL_InitializeCoreCLR(entrypointExecutable);
+        DWORD error = PAL_InitializeCoreCLR(entrypointExecutable, true /*runningInExe*/);
 
         // If PAL initialization failed, then we should return right away and avoid
         // calling any other APIs because they can end up calling into the PAL layer again.
@@ -1656,7 +1656,7 @@ extern "C" EXPORT_API MonoClass* mono_get_object_class()
     return (MonoClass*)CoreLibBinder::GetClass(CLASS__OBJECT);
 }
 
-#if PLATFORM_WIN || PLATFORM_OSX || PLATFORM_ANDROID || PLATFORM_TIZEN || PLATFORM_STV || PLATFORM_LINUX
+#if defined(HOST_OSX) || defined(HOST_UNIX)
 extern "C" EXPORT_API void mono_set_signal_chaining(gboolean)
 {
     // NOP
@@ -2994,7 +2994,7 @@ struct MethodTable_InterfaceMapIteratorWrapper
 {
     MethodTable::InterfaceMapIterator iter;
 
-    MethodTable_InterfaceMapIteratorWrapper::MethodTable_InterfaceMapIteratorWrapper(MonoClass_clr* klass_clr) :
+    MethodTable_InterfaceMapIteratorWrapper(MonoClass_clr* klass_clr) :
         iter(klass_clr->IterateInterfaceMap())
     {
     }
@@ -4117,7 +4117,7 @@ extern "C" EXPORT_API void mono_set_crash_chaining (gboolean)
 {
 }
 
-#if PLATFORM_OSX
+#if defined(HOST_OSX) || defined(HOST_UNIX)
 extern "C" EXPORT_API int mono_unity_backtrace_from_context(void* context, void* array[], int count)
 {
     ASSERT_NOT_IMPLEMENTED;
