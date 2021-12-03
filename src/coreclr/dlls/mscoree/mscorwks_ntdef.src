@@ -253,3 +253,19 @@ EXPORTS
         mono_trace_set_level_string
         mono_trace_set_mask_string
         coreclr_array_length
+        mono_set_assemblies_path_null_separated
+        mono_assembly_name_free
+        mono_type_get_name_full
+        mono_unity_class_get_generic_type_definition
+        mono_field_get_type_specific
+        mono_type_get_num_generic_args
+        mono_type_get_generic_arg
+        mono_gc_wbarrier_set_field
+        mono_runtime_invoke_with_nested_object
+        mono_type_is_byref
+        mono_set_gc_conservative
+        mono_unity_gc_disable
+        mono_unity_gc_enable
+        mono_unity_gc_is_disabled
+        mono_custom_attrs_get_attrs
+        mono_enter_internal_call

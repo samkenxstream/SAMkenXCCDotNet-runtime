@@ -20,6 +20,9 @@
 #include "pal.h"
 #endif // FEATURE_PAL
 
+// we only need domain reload for Editor
+// #define UNITY_SUPPORT_DOMAIN_UNLOAD 1
+
 
 #ifdef WIN32
 #define EXPORT_API __declspec(dllexport)
@@ -946,7 +949,6 @@ MonoClass * mono_class_from_name(MonoImage *image, const char* name_space, const
         PRECONDITION(name != nullptr);
     }
     CONTRACTL_END;
-    GCX_COOP();
     auto assembly = (MonoAssembly_clr*)image;
     DomainAssembly* domainAssembly = assembly->GetDomainAssembly();
 
@@ -964,6 +966,7 @@ MonoClass * mono_class_from_name(MonoImage *image, const char* name_space, const
         {
             if ((*g_LoadedImages)[i].image == image)
             {
+                GCX_COOP();
                 MonoDomain *domain = (*g_LoadedImages)[i].domain;
                 Object* domainObj = (Object*)GetMonoDomainObject(domain);
                 keepAlive = ObjectToOBJECTREF(domainObj);
@@ -972,11 +975,14 @@ MonoClass * mono_class_from_name(MonoImage *image, const char* name_space, const
         }
     }
 
-    TypeHandle retTypeHandle = TypeName::GetTypeManaged(fullTypeName.GetUnicode(), domainAssembly, FALSE, ignoreCase, TRUE, NULL, &keepAlive);
-
-    if (!retTypeHandle.IsNull())
     {
-        return (MonoClass*)retTypeHandle.AsMethodTable();
+        // TODO: this cannot be called in Coop GC mode
+        TypeHandle retTypeHandle = TypeName::GetTypeManaged(fullTypeName.GetUnicode(), domainAssembly, FALSE, ignoreCase, TRUE, NULL, &keepAlive);
+
+        if (!retTypeHandle.IsNull())
+        {
+            return (MonoClass*)retTypeHandle.AsMethodTable();
+        }
     }
 
     return NULL;
@@ -1024,10 +1030,15 @@ extern "C" EXPORT_API MonoAssembly * mono_domain_assembly_open(MonoDomain *domai
 
 extern "C" EXPORT_API MonoDomain * mono_domain_create_appdomain(const char *domainname, const char* configfile)
 {
+#if UNITY_SUPPORT_DOMAIN_UNLOAD
     auto alcWrapperObject = mono_object_new(NULL, gALCWrapperClass);
     mono_runtime_object_init(alcWrapperObject);
     SetupDomainPaths(alcWrapperObject);
     return CreateMonoDomainFromObject(alcWrapperObject);
+#else
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+#endif
 }
 
 void UnloadFailure()
@@ -1102,7 +1113,7 @@ MonoObject* domain_unload(MonoDomain* domain)
 extern "C" EXPORT_API void mono_set_gc_conservative(bool conservative)
 {
     ASSERT_NOT_IMPLEMENTED;
-    // JON TODO: I set this in config. Do we need this set here still?
+    // TODO: I set this in config. Do we need this set here still?
     //g_pConfig->SetGCConservative(conservative);
 }
 
@@ -2025,7 +2036,7 @@ extern "C" EXPORT_API gboolean mono_class_is_subclass_of(MonoClass *klass, MonoC
         {
             auto ifaceIter = clazz->IterateInterfaceMap();
             while (ifaceIter.Next())
-                if (ifaceIter.GetInterfaceApprox() /* JON */ == clazzc)
+                if (ifaceIter.GetInterfaceApprox() /* TODO: this used to be GetInterface, is this okay? */ == clazzc)
                     return TRUE;
         }
         clazz = clazz->GetParentMethodTable();
@@ -2377,7 +2388,7 @@ mono_set_find_plugin_callback (gconstpointer find)
 extern "C" EXPORT_API void mono_runtime_unhandled_exception_policy_set(MonoRuntimeUnhandledExceptionPolicy policy)
 {
     ASSERT_NOT_IMPLEMENTED;
-    /* JON
+    /* TODO
     switch (policy)
     {
         case MONO_UNHANDLED_POLICY_LEGACY:
@@ -2511,7 +2522,6 @@ extern "C" EXPORT_API MonoImage* mono_image_open_from_data_with_name(char *data,
     TRACE_API("%p, %d, %d, %p, %d, %s", data, data_len, need_copy, status, refonly, name);
 
     GCX_COOP();
-
     gint64 len = data_len;
     void* params[2] = { data, &len };
     auto assemblyObject = (AssemblyBaseObject*)mono_runtime_invoke(gALCWrapperLoadFromAssemblyDataMethod, GetMonoDomainObject(mono_domain_get()), params, NULL);
@@ -2932,10 +2942,11 @@ extern "C" EXPORT_API gboolean mono_class_is_enum(MonoClass *klass)
 
 extern "C" EXPORT_API MonoType* mono_class_enum_basetype(MonoClass *klass)
 {
+    // the type loading path now can throw exceptions and trigger GC so comment out for now
         CONTRACTL
     {
-        NOTHROW;
-    GC_NOTRIGGER;
+  //      NOTHROW;
+ //   GC_NOTRIGGER;
     PRECONDITION(klass != NULL);
     }
     CONTRACTL_END;
@@ -2989,6 +3000,17 @@ extern "C" EXPORT_API MonoAssembly* mono_assembly_load_from_full(MonoImage *imag
     return (MonoAssembly*)image;
 }
 
+// Wrap iterator value in heap allocated value we can return from embedding API
+struct MethodTable_InterfaceMapIteratorWrapper
+{
+    MethodTable::InterfaceMapIterator iter;
+
+    MethodTable_InterfaceMapIteratorWrapper::MethodTable_InterfaceMapIteratorWrapper(MonoClass_clr* klass_clr) :
+        iter(klass_clr->IterateInterfaceMap())
+    {
+    }
+};
+
 extern "C" EXPORT_API MonoClass* mono_class_get_interfaces(MonoClass* klass, gpointer *iter)
 {
     TRACE_API("%p, %p", klass, iter);
@@ -3007,22 +3029,22 @@ extern "C" EXPORT_API MonoClass* mono_class_get_interfaces(MonoClass* klass, gpo
     }
     MonoClass_clr* klass_clr = (MonoClass_clr*)klass;
 
-    MethodTable::InterfaceMapIterator* iterator = (MethodTable::InterfaceMapIterator*)*iter;
+    MethodTable_InterfaceMapIteratorWrapper* iterator = (MethodTable_InterfaceMapIteratorWrapper*)*iter;
     if (iterator == nullptr)
     {
-        iterator = /*new MethodTable::InterfaceMapIterator(klass_clr); JON FIXME */ &klass_clr->IterateInterfaceMap();
+        iterator = new MethodTable_InterfaceMapIteratorWrapper(klass_clr);
         *iter = iterator;
     }
 
-    if (!iterator->Next())
+    if (!iterator->iter.Next())
     {
         *iter = nullptr;
         delete iterator;
         return nullptr;
     }
 
-    /*return (MonoClass*)iterator->GetInterface(); JON*/
-    return (MonoClass*)iterator->GetInterfaceApprox();
+    // TODO: this used to be a call to GetInterface, not sure of the difference
+    return (MonoClass*)iterator->iter.GetInterfaceApprox();
 }
 
 extern "C" EXPORT_API void mono_assembly_close(MonoAssembly *assembly)
