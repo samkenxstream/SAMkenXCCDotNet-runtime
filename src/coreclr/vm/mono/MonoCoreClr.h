@@ -65,6 +65,6 @@ typedef void* mono_liveness_world_state_callback;
 
 #include "MonoTypesClr.h"
 #include "MonoFunctionsClr.h"
-#include "../../../../../unity/unity-sources/Runtime/Mono/tabledefs.h"
+#include "../../../../unity/unity-sources/Runtime/Mono/tabledefs.h"
 
 #endif //MONOCORECLR_H
