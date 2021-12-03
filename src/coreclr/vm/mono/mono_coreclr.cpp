@@ -1656,7 +1656,7 @@ extern "C" EXPORT_API MonoClass* mono_get_object_class()
     return (MonoClass*)CoreLibBinder::GetClass(CLASS__OBJECT);
 }
 
-#if defined(HOST_OSX) || defined(HOST_UNIX)
+#if defined(HOST_OSX) || defined(HOST_UNIX) || defined(HOST_WINDOWS)
 extern "C" EXPORT_API void mono_set_signal_chaining(gboolean)
 {
     // NOP
