@@ -27,6 +27,9 @@ struct MonoCustomAttrInfo;
 struct MonoDl;
 struct MonoManagedMemorySnapshot;
 struct MonoProfiler;
+struct MonoMethod;
+struct MonoTableInfo;
+struct MonoGenericContext;
 
 #if UNITY_STANDALONE || UNITY_EDITOR
 struct MonoDlFallbackHandler;
@@ -80,18 +83,11 @@ struct GPtrArray
 typedef enum
 {
     MONO_VERIFIER_MODE_OFF,
+    MONO_VERIFIER_PE_ONLY,
     MONO_VERIFIER_MODE_VALID,
     MONO_VERIFIER_MODE_VERIFIABLE,
     MONO_VERIFIER_MODE_STRICT
 } MiniVerifierMode;
-
-typedef enum
-{
-    MONO_SECURITY_MODE_NONE,
-    MONO_SECURITY_MODE_CORE_CLR,
-    MONO_SECURITY_MODE_CAS,
-    MONO_SECURITY_MODE_SMCS_HACK
-} MonoSecurityMode;
 
 typedef enum
 {
@@ -100,6 +96,13 @@ typedef enum
     MONO_TYPE_NAME_FORMAT_FULL_NAME,
     MONO_TYPE_NAME_FORMAT_ASSEMBLY_QUALIFIED
 } MonoTypeNameFormat;
+
+typedef enum
+{
+    MONO_GC_MODE_DISABLED = 0,
+    MONO_GC_MODE_ENABLED = 1,
+    MONO_GC_MODE_MANUAL = 2
+}  MonoGCMode;
 
 typedef struct
 {
@@ -115,6 +118,9 @@ typedef struct
     UInt16 major, minor, build, revision;
     // only used and populated by newer Mono
     UInt16 arch;
+    UInt8 without_version;
+    UInt8 without_culture;
+    UInt8 without_public_key_token;
 } MonoAssemblyName;
 
 typedef void GFuncRef (void*, void*);
@@ -125,13 +131,6 @@ typedef enum
     MONO_UNHANDLED_POLICY_LEGACY,
     MONO_UNHANDLED_POLICY_CURRENT
 } MonoRuntimeUnhandledExceptionPolicy;
-
-typedef enum
-{
-    MONO_DL_LAZY  = 1,
-    MONO_DL_LOCAL = 2,
-    MONO_DL_MASK  = 3
-} MonoDynamicLibraryFlag;
 
 #if ENABLE_MONO_MEMORY_CALLBACKS
 struct MonoMemoryCallbacks;
@@ -279,7 +278,9 @@ typedef enum
     FRAME_TYPE_INTERP = 4,
     /* Frame for transitioning from interpreter to managed code */
     FRAME_TYPE_INTERP_TO_MANAGED = 5,
-    FRAME_TYPE_NUM = 6
+    /* same, but with MonoContext */
+    FRAME_TYPE_INTERP_TO_MANAGED_WITH_CTX = 6,
+    FRAME_TYPE_NUM = 7
 } MonoStackFrameType;
 
 typedef struct
@@ -322,6 +323,15 @@ typedef struct
     /* For FRAME_TYPE_INTERP */
     gpointer interp_frame;
 
+    /*
+     * A stack address associated with the frame which can be used
+     * to compare frames.
+     * This is needed because ctx is not changed when unwinding through
+     * interpreter frames, it still refers to the last native interpreter
+     * frame.
+     */
+    gpointer frame_addr;
+
     /* The next fields are only useful for the jit */
     gpointer lmf;
     guint32 unwind_info_len;
@@ -353,6 +363,21 @@ typedef enum
 
 #endif // UNITY_ANDROID
 
+struct MonoUnityCallstackFilter
+{
+    const char* name_space;
+    const char* class_name;
+    const char* method_name;
+};
+
+struct MonoUnityCallstackOptions
+{
+    const char *path_prefix_filter;
+    int filter_count;
+    const MonoUnityCallstackFilter *line_filters;
+};
+
+
 /*Keep in sync with MonoErrorInternal*/
 typedef struct _MonoError
 {
@@ -361,5 +386,10 @@ typedef struct _MonoError
 
     void *hidden_1[12];  /*DON'T TOUCH */
 } MonoError;
+
+typedef uintptr_t MonoGCHandle;
+
+
+typedef void*(*mono_liveness_reallocate_callback)(void* ptr, size_t size, void* state);
 
 #endif //ENABLE_MONO

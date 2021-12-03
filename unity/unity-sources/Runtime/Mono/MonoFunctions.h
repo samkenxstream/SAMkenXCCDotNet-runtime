@@ -10,6 +10,7 @@ typedef UNUSED_SYMBOL void(*MonoUnityExceptionFunc) (MonoObject* exc);
 
 // If you add functions to this file you also need to expose them in MonoBundle.exp
 // Otherwise they wont be exported in the web plugin!
+DO_API(gboolean, mono_unity_class_has_failure, (MonoClass * klass))
 DO_API(void, mono_thread_suspend_all_other_threads, ())
 DO_API(void, mono_thread_pool_cleanup, ())
 DO_API(void, mono_threads_set_shutting_down, ())
@@ -20,11 +21,7 @@ DO_API(void, mono_runtime_cleanup, (MonoDomain * domain))
 DO_API(MonoMethod*, mono_object_get_virtual_method, (MonoObject * obj, MonoMethod * method))
 
 DO_API(void, mono_add_internal_call, (const char *name, gconstpointer method))
-#if USE_CONSOLEBRANCH_MONO
-DO_API(void, mono_jit_cleanup, (MonoDomain * domain))
-#else
 DO_API(void, mono_unity_jit_cleanup, (MonoDomain * domain))
-#endif
 DO_API(MonoDomain*, mono_jit_init_version, (const char *file, const char* runtime_version))
 DO_API(void*, mono_jit_info_get_code_start, (void* jit))
 DO_API(int, mono_jit_info_get_code_size, (void* jit))
@@ -36,6 +33,8 @@ DO_API(void, mono_domain_unload, (MonoDomain * domain))
 #if UNITY_EDITOR
 DO_API(void, mono_unity_domain_unload, (MonoDomain * domain, MonoUnityExceptionFunc callback))
 #endif
+DO_API(gboolean, mono_unity_class_is_open_constructed_type, (MonoClass * klass))
+DO_API(MonoException*, mono_unity_error_convert_to_exception, (MonoError * error))
 DO_API(MonoObject*, mono_object_new, (MonoDomain * domain, MonoClass * klass))
 DO_API(void, mono_runtime_object_init, (MonoObject * this_obj))
 DO_API(MonoObject*, mono_runtime_invoke, (MonoMethod * method, void *obj, void **params, MonoException **exc))
@@ -53,21 +52,18 @@ DO_API(MonoDomain*, mono_get_root_domain, ())
 DO_API(gint32, mono_domain_get_id, (MonoDomain * domain))
 DO_API(void, mono_assembly_foreach, (GFunc func, gpointer user_data))
 DO_API(void, mono_image_close, (MonoImage * image))
-//DO_API(void,mono_set_unhandled_exception_handler,(void* function))
 DO_API(const char*, mono_image_get_name, (MonoImage * image))
 DO_API(MonoClass*, mono_get_object_class, ())
 #if PLATFORM_WIN || PLATFORM_OSX || PLATFORM_ANDROID || PLATFORM_LINUX
 DO_API(void, mono_set_signal_chaining, (gboolean))
 #endif
 
-#if !USE_CONSOLEBRANCH_MONO
 DO_API(void, mono_unity_runtime_set_main_args, (int, const char* argv[]))
-#endif
+DO_API(void, mono_dllmap_insert, (MonoImage * assembly, const char *dll, const char *func, const char *tdll, const char *tfunc))
 
 #if USE_MONO_AOT
 DO_API(void*, mono_aot_get_method, (MonoDomain * domain, MonoMethod * method))
 #endif
-//DO_API(MonoMethod*, mono_marshal_get_xappdomain_invoke, (MonoMethod*))
 
 DO_API(void, mono_gc_wbarrier_set_field, (MonoObject * obj, gpointer field_ptr, MonoObject * value))
 
@@ -84,31 +80,28 @@ DO_API(gboolean, mono_type_generic_inst_is_valuetype, (MonoType*))
 #endif
 DO_API(char*, mono_type_get_name_full, (MonoType * type, MonoTypeNameFormat format))
 
-#if PLATFORM_WIN || PLATFORM_XBOXONE
+#if PLATFORM_WIN
 DO_API(gunichar2*, mono_string_to_utf16, (MonoString * string_obj))
 #endif
 
 DO_API(const char*, mono_field_get_name, (MonoClassField * field))
 DO_API(MonoClass*, mono_field_get_parent, (MonoClassField * field))
 DO_API(MonoType*, mono_field_get_type, (MonoClassField * field))
-#if !USE_CONSOLEBRANCH_MONO
 DO_API(gboolean, mono_type_is_byref, (MonoType * type))
 DO_API(guint32, mono_type_get_attrs, (MonoType * type))
-#endif
 DO_API(int, mono_type_get_type, (MonoType * type))
 DO_API(const char*, mono_method_get_name, (MonoMethod * method))
 DO_API(char*, mono_method_full_name, (MonoMethod * method, gboolean signature))
 DO_API(MonoImage*, mono_assembly_get_image, (MonoAssembly * assembly))
 DO_API(MonoClass*, mono_method_get_class, (MonoMethod * method))
 DO_API(MonoClass*, mono_object_get_class, (MonoObject * obj))
+DO_API(MonoClass*, mono_class_get, (MonoImage * image, guint32 type_token))
 DO_API(MonoObject*, mono_object_isinst, (MonoObject * obj, MonoClass * klass))
 DO_API(gboolean, mono_class_is_valuetype, (MonoClass * klass))
 DO_API(gboolean, mono_class_is_blittable, (MonoClass * klass))
 DO_API(guint32, mono_signature_get_param_count, (MonoMethodSignature * sig))
 DO_API(char*, mono_string_to_utf8, (MonoString * string_obj))
-#if !USE_CONSOLEBRANCH_MONO
 DO_API(MonoString*, mono_unity_string_empty_wrapper, ())
-#endif
 DO_API(MonoString*, mono_string_new_wrapper, (const char* text))
 DO_API(MonoString*, mono_string_new_len, (MonoDomain * domain, const char *text, guint32 length))
 DO_API(MonoString*, mono_string_new_utf16, (MonoDomain * domain, const guint16 * text, gint32 length))
@@ -120,6 +113,7 @@ DO_API(const char*, mono_class_get_name, (MonoClass * klass))
 DO_API(char*, mono_type_get_name, (MonoType * type))
 DO_API(MonoClass*, mono_type_get_class, (MonoType * type))
 DO_API(gboolean, mono_metadata_type_equal, (MonoType * t1, MonoType * t2))
+DO_API(void, mono_metadata_decode_row, (const MonoTableInfo * t, int idx, guint32 * res, int res_size))
 DO_API(MonoException *, mono_exception_from_name_msg, (MonoImage * image, const char *name_space, const char *name, const char *msg))
 DO_API(MonoException *, mono_exception_from_name_two_strings, (MonoImage * image, const char *name_space, const char *name, const char *msg1, const char *msg2))
 DO_API(MonoException *, mono_get_exception_argument_null, (const char *arg))
@@ -136,12 +130,8 @@ DO_API(MonoClass*, mono_get_int64_class, ())
 DO_API(MonoClass*, mono_get_single_class, ())
 DO_API(MonoClass*, mono_get_double_class, ())
 DO_API(MonoArray*, mono_array_new, (MonoDomain * domain, MonoClass * eclass, guint32 n))
-#if USE_CONSOLEBRANCH_MONO
-DO_API(MonoArray*, mono_array_new_full, (MonoDomain * domain, MonoClass * array_class, guint32 * lengths, guint32 * lower_bounds))
-#else
 DO_API(MonoArray*, mono_unity_array_new_2d, (MonoDomain * domain, MonoClass * eclass, size_t size0, size_t size1))
 DO_API(MonoArray*, mono_unity_array_new_3d, (MonoDomain * domain, MonoClass * eclass, size_t size0, size_t size1, size_t size2))
-#endif
 
 DO_API(MonoClass *, mono_array_class_get, (MonoClass * eclass, guint32 rank))
 
@@ -150,14 +140,13 @@ DO_API(MonoObject*, mono_type_get_object, (MonoDomain * domain, MonoType * type)
 DO_API(gboolean, mono_class_is_generic, (MonoClass * klass))
 DO_API(gboolean, mono_class_is_inflated, (MonoClass * klass))
 
-#if !USE_CONSOLEBRANCH_MONO
 DO_API(gboolean, unity_mono_method_is_generic, (MonoMethod * method))
 DO_API(gboolean, unity_mono_method_is_inflated, (MonoMethod * method))
-#endif
 
 DO_API(MonoThread *, mono_thread_attach, (MonoDomain * domain))
 
 DO_API(void, mono_thread_detach, (MonoThread * thread))
+DO_API(gboolean, mono_thread_has_sufficient_execution_stack, (void))
 
 #if USE_MONO_DOMAINS
 DO_API(void, mono_unity_thread_fast_attach, (MonoDomain * domain))
@@ -175,22 +164,24 @@ DO_API(void, mono_runtime_unhandled_exception_policy_set, (MonoRuntimeUnhandledE
 DO_API(MonoClass*, mono_class_get_nesting_type, (MonoClass * klass))
 DO_API(MonoVTable*, mono_class_vtable, (MonoDomain * domain, MonoClass * klass))
 DO_API(MonoReflectionMethod*, mono_method_get_object, (MonoDomain * domain, MonoMethod * method, MonoClass * refclass))
+DO_API(MonoReflectionField*, mono_field_get_object, (MonoDomain * domain, MonoClass * klass, MonoClassField * field))
+DO_API(MonoClassField* , mono_field_from_token, (MonoImage * image, uint32_t token, MonoClass** retklass, MonoGenericContext * context))
+DO_API(MonoClassField*, mono_unity_field_from_token_checked, (MonoImage * image, guint32 token, MonoClass** retklass, MonoGenericContext * context, MonoError * error))
 
 DO_API(MonoMethodSignature*, mono_method_signature, (MonoMethod * method))
-DO_API(MonoMethodSignature*, mono_method_signature_checked, (MonoMethod * method, MonoError * error))
+DO_API(MonoMethodSignature*, mono_method_signature_checked_slow, (MonoMethod * method, MonoError * error))
 DO_API(MonoType*, mono_signature_get_params, (MonoMethodSignature * sig, gpointer * iter))
 DO_API(MonoType*, mono_signature_get_return_type, (MonoMethodSignature * sig))
 DO_API(MonoType*, mono_class_get_type, (MonoClass * klass))
 
 DO_API(void, mono_debug_init, (int format))
 
-#if !USE_CONSOLEBRANCH_MONO
 DO_API(gboolean, mono_is_debugger_attached, (void))
-#endif
 
 DO_API(void, mono_debug_open_image_from_memory, (MonoImage * image, const char *raw_contents, int size))
 DO_API(guint32, mono_field_get_flags, (MonoClassField * field))
 DO_API(MonoImage*, mono_image_open_from_data_full, (const void *data, guint32 data_len, gboolean need_copy, int *status, gboolean ref_only))
+DO_API(const char*, mono_image_strerror, (int status))
 DO_API(MonoImage*, mono_image_open_from_data_with_name, (char *data, guint32 data_len, gboolean need_copy, int *status, gboolean refonly, const char *name))
 DO_API(MonoAssembly *, mono_assembly_load_from, (MonoImage * image, const char*fname, int *status))
 DO_API(gboolean, mono_assembly_fill_assembly_name, (MonoImage * image, MonoAssemblyName * aname))
@@ -198,12 +189,9 @@ DO_API(char*, mono_stringify_assembly_name, (MonoAssemblyName * aname))
 DO_API(int, mono_assembly_name_parse, (const char* name, MonoAssemblyName * assembly))
 DO_API(void, mono_assembly_name_free, (MonoAssemblyName * assembly))
 DO_API(MonoAssembly*, mono_assembly_loaded, (MonoAssemblyName * aname))
+DO_API(const MonoTableInfo*, mono_image_get_table_info, (MonoImage * image, int table_id))
 DO_API(int, mono_image_get_table_rows, (MonoImage * image, int table_id))
-#if USE_CONSOLEBRANCH_MONO
-DO_API(MonoClass*, mono_class_get, (MonoImage * image, guint32 type_token))
-#else
 DO_API(MonoClass*, mono_unity_class_get, (MonoImage * image, guint32 type_token))
-#endif
 DO_API(gboolean, mono_metadata_signature_equal, (MonoMethodSignature * sig1, MonoMethodSignature * sig2))
 
 DO_API(MonoObject *, mono_value_box, (MonoDomain * domain, MonoClass * klass, gpointer val))
@@ -215,15 +203,9 @@ DO_API(MonoType*, mono_class_get_byref_type, (MonoClass * klass))
 
 DO_API(void, mono_field_static_get_value, (MonoVTable * vt, MonoClassField * field, void *value))
 DO_API(void, mono_unity_set_embeddinghostname, (const char* name))
-#if USE_CONSOLEBRANCH_MONO
-DO_API(void, mono_set_assemblies_path, (const char* name))
-#else
 DO_API(void, mono_set_assemblies_path_null_separated, (const char* name))
-#endif
 
-DO_API(void, mono_unity_gc_disable, ());
-DO_API(void, mono_unity_gc_enable, ());
-DO_API(int, mono_unity_gc_is_disabled, ());
+DO_API(void, mono_unity_gc_set_mode, (MonoGCMode mode));
 
 DO_API_OPTIONAL(gint64, mono_gc_get_max_time_slice_ns, ());
 DO_API_OPTIONAL(void, mono_gc_set_max_time_slice_ns, (gint64 maxTimeSlice));
@@ -231,23 +213,29 @@ DO_API_OPTIONAL(gboolean, mono_gc_is_incremental, ());
 DO_API_OPTIONAL(void, mono_gc_set_incremental, (gboolean value));
 
 DO_API(guint32, mono_gchandle_new, (MonoObject * obj, gboolean pinned))
-DO_API(MonoObject*, mono_gchandle_get_target, (guint32 gchandle))
-
 DO_API(guint32, mono_gchandle_new_weakref, (MonoObject * obj, gboolean track_resurrection))
-
-DO_API(gboolean, mono_gchandle_is_in_domain, (guint32 gchandle, MonoDomain * domain))
-DO_API(MonoObject*, mono_assembly_get_object, (MonoDomain * domain, MonoAssembly * assembly))
-
+DO_API(MonoObject*, mono_gchandle_get_target, (guint32 gchandle))
 DO_API(void, mono_gchandle_free, (guint32 gchandle))
+DO_API(gboolean, mono_gchandle_is_in_domain, (guint32 gchandle, MonoDomain * domain))
+
+//DO_API(MonoGCHandle, mono_gchandle_new_v2, (MonoObject * obj, gboolean pinned))
+//DO_API(MonoGCHandle, mono_gchandle_new_weakref_v2, (MonoObject * obj, gboolean track_resurrection))
+//DO_API(MonoObject*, mono_gchandle_get_target_v2, (MonoGCHandle gchandle))
+//DO_API(void, mono_gchandle_free_v2, (MonoGCHandle gchandle))
+//DO_API(gboolean, mono_gchandle_is_in_domain_v2, (MonoGCHandle gchandle, MonoDomain * domain))
+
+DO_API(MonoObject*, mono_assembly_get_object, (MonoDomain * domain, MonoAssembly * assembly))
 
 typedef UNUSED_SYMBOL gboolean(*MonoStackWalk) (MonoMethod *method, gint32 native_offset, gint32 il_offset, gboolean managed, gpointer data);
 DO_API(void, mono_stack_walk, (MonoStackWalk func, gpointer user_data));
 DO_API(void, mono_stack_walk_no_il, (MonoStackWalk start, void* user_data));
 
 DO_API(char*, mono_pmip, (void *ip));
-DO_API(MonoObject*, mono_runtime_delegate_invoke, (MonoObject * delegate, void **params, MonoException **exc))
+DO_API(MonoObject*, mono_runtime_delegate_invoke, (MonoObject * delegate, void** params, MonoException** exc))
 
 DO_API(MonoJitInfo*, mono_jit_info_table_find, (MonoDomain * domain, void* ip))
+
+DO_API(int, mono_unity_managed_callstack, (unsigned char* buffer, int bufferSize, const MonoUnityCallstackOptions * opts));
 
 DO_API_OPTIONAL(MonoDebugSourceLocation*, mono_debug_lookup_source_location_by_il, (MonoMethod * method, guint32 il_offset, MonoDomain * domain))
 DO_API(MonoDebugSourceLocation*, mono_debug_lookup_source_location, (MonoMethod * method, guint32 address, MonoDomain * domain))
@@ -256,7 +244,7 @@ DO_API_OPTIONAL(MonoDebugMethodJitInfo*, mono_debug_find_method, (MonoMethod * m
 DO_API_OPTIONAL(void, mono_debug_free_method_jit_info, (MonoDebugMethodJitInfo * jit))
 
 // We need to hook into the Boehm GC internals to perform validation of write barriers
-#if !ENABLE_MONO_SGEN && ENABLE_SCRIPTING_GC_WBARRIERS && UNITY_DEVELOPER_BUILD
+#if ENABLE_SCRIPTING_GC_WBARRIERS && UNITY_DEVELOPER_BUILD
 DO_API_OPTIONAL(void, GC_dirty_inner, (void **ptr))
 DO_API_OPTIONAL(void*, GC_malloc, (size_t size))
 DO_API_OPTIONAL(void*, GC_malloc_uncollectable, (size_t size))
@@ -266,15 +254,15 @@ DO_API_OPTIONAL(void*, GC_gcj_malloc, (size_t size, void *))
 DO_API_OPTIONAL(void*, GC_free, (void*))
 #endif
 
-//DO_API (void,GC_free,(void* p))
-//DO_API(void*,GC_malloc_uncollectable,(int size))
 DO_API(MonoProperty*, mono_class_get_properties, (MonoClass * klass, gpointer * iter))
 DO_API(MonoMethod*, mono_property_get_get_method, (MonoProperty * prop))
 DO_API(MonoObject *, mono_object_new_alloc_specific, (MonoVTable * vtable))
 DO_API(MonoObject *, mono_object_new_specific, (MonoVTable * vtable))
+//DO_API(MonoDomain*, mono_object_get_domain, (MonoObject *obj))
 
 DO_API(void, mono_gc_collect, (int generation))
 DO_API_OPTIONAL(int, mono_gc_collect_a_little, ())
+DO_API_OPTIONAL(void, mono_gc_start_incremental_collection, ())
 DO_API(int, mono_gc_max_generation, ())
 
 DO_API(gint64, mono_gc_get_used_size, ())
@@ -302,13 +290,12 @@ DO_API(MonoClass*, mono_class_get_element_class, (MonoClass * klass));
 DO_API(gboolean, mono_unity_class_is_interface, (MonoClass * klass))
 DO_API(gboolean, mono_unity_class_is_abstract, (MonoClass * klass))
 DO_API(MonoClass*, mono_unity_class_get_generic_type_definition, (MonoClass * klass))
+DO_API(MonoMethod*, mono_get_method, (MonoImage * image, guint32 token, MonoClass * klass))
 
 DO_API(int, mono_array_element_size, (MonoClass * classOfArray))
 
 DO_API(gboolean, mono_domain_set, (MonoDomain * domain, gboolean force))
-#if !USE_CONSOLEBRANCH_MONO
 DO_API(void, mono_unity_domain_set_config, (MonoDomain * domain, const char *base_dir, const char *config_file_name))
-#endif
 DO_API(void, mono_thread_push_appdomain_ref, (MonoDomain * domain))
 DO_API(void, mono_thread_pop_appdomain_ref, ())
 
@@ -323,20 +310,20 @@ DO_API(int, mono_parse_default_optimizations, (const char* p))
 DO_API(void, mono_set_defaults, (int verbose_level, guint32 opts))
 DO_API(void, mono_config_parse, (const char *filename))
 DO_API(void, mono_set_dirs, (const char *assembly_dir, const char *config_dir))
-//DO_API(void,ves_icall_System_AppDomain_InternalUnload,(int domain_id))
-//DO_API(MonoObject*,ves_icall_System_AppDomain_createDomain,(MonoString *friendly_name, MonoObject *setup))
 
 #if UNITY_EDITOR
-// Not defined in current mono-consoles,  June 2 2015
 DO_API(void, mono_set_break_policy, (MonoBreakPolicyFunc policy_callback))
 #endif
 
+DO_API(void, mono_set_ignore_version_and_key_when_finding_assemblies_already_loaded, (gboolean value))
+DO_API(void, mono_verifier_set_mode, (MiniVerifierMode mode))
 DO_API(void, mono_jit_parse_options, (int argc, char * argv[]))
 DO_API(gpointer, mono_object_unbox, (MonoObject * o))
 
 DO_API(MonoObject*, mono_custom_attrs_get_attr, (MonoCustomAttrInfo * ainfo, MonoClass * attr_klass))
 
 DO_API(MonoArray*, mono_custom_attrs_construct, (MonoCustomAttrInfo * cinfo))
+DO_API(MonoArray*, mono_unity_custom_attrs_construct, (MonoCustomAttrInfo * cinfo, MonoError * error))
 
 DO_API(gboolean, mono_custom_attrs_has_attr, (MonoCustomAttrInfo * ainfo, MonoClass * attr_klass))
 DO_API(MonoCustomAttrInfo*, mono_custom_attrs_from_field, (MonoClass * klass, MonoClassField * field))
@@ -347,17 +334,10 @@ DO_API(MonoCustomAttrInfo*, mono_custom_attrs_from_assembly, (MonoAssembly * ass
 DO_API(MonoArray*, mono_reflection_get_custom_attrs_by_type, (MonoObject * object, MonoClass * klass))
 DO_API(void, mono_custom_attrs_free, (MonoCustomAttrInfo * attr))
 
-#if !USE_CONSOLEBRANCH_MONO
 DO_API(void, mono_unity_set_data_dir, (const char * dir));
 DO_API(MonoClass*, mono_custom_attrs_get_attrs, (MonoCustomAttrInfo * ainfo, void** iterator))
-#endif
 
-#if USE_CONSOLEBRANCH_MONO
-DO_API(void*, mono_loader_get_last_error, (void))
-DO_API(MonoException*, mono_loader_error_prepare_exception, (void *error))
-#else
 DO_API(MonoException*, mono_unity_loader_get_last_error_and_error_prepare_exception, (void))
-#endif
 
 #if PLATFORM_STANDALONE || UNITY_EDITOR
 // DllImport fallback handling to load native libraries from custom locations
@@ -365,37 +345,21 @@ typedef UNUSED_SYMBOL void* (*MonoDlFallbackLoad) (const char *name, int flags, 
 typedef UNUSED_SYMBOL void* (*MonoDlFallbackSymbol) (void *handle, const char *name, char **err, void *user_data);
 typedef UNUSED_SYMBOL void* (*MonoDlFallbackClose) (void *handle, void *user_data);
 
-#   if !PLATFORM_XBOXONE
-// Not defined in current mono-consoles,  Nov 25 2013
 DO_API(MonoDlFallbackHandler*, mono_dl_fallback_register, (MonoDlFallbackLoad load_func, MonoDlFallbackSymbol symbol_func, MonoDlFallbackClose close_func, void *user_data))
 DO_API(void, mono_dl_fallback_unregister, (MonoDlFallbackHandler * handler))
-#   endif
 
 #endif
 
 typedef UNUSED_SYMBOL void(*vprintf_func)(const char* msg, va_list args);
 DO_API(void, mono_unity_set_vprintf_func, (vprintf_func func))
 
-DO_API(void, mono_unity_liveness_stop_gc_world, ())
+DO_API(void*, mono_unity_liveness_allocate_struct, (MonoClass * filter, int max_object_count, mono_register_object_callback callback, void* userdata, mono_liveness_reallocate_callback reallocate))
 DO_API(void, mono_unity_liveness_finalize, (void* state))
-DO_API(void, mono_unity_liveness_start_gc_world, ())
 DO_API(void, mono_unity_liveness_free_struct, (void* state))
-#if USE_CONSOLEBRANCH_MONO
-DO_API(void*, mono_unity_liveness_calculation_begin, (MonoClass * filter, int max_object_count, mono_register_object_callback callback, void* userdata))
-#else
-DO_API(void*, mono_unity_liveness_calculation_begin, (MonoClass * filter, int max_object_count, mono_register_object_callback callback, void* userdata, mono_liveness_world_state_callback world_started_callback, mono_liveness_world_state_callback world_stopped_callback))
-#endif
-DO_API(void, mono_unity_liveness_calculation_end, (void* state))
 DO_API(void, mono_unity_liveness_calculation_from_root, (MonoObject * root, void* state))
 DO_API(void, mono_unity_liveness_calculation_from_statics, (void* state))
 
-#if !USE_CONSOLEBRANCH_MONO
 DO_API(MonoMethod*, unity_mono_reflection_method_get_method, (MonoReflectionMethod * mrf))
-#endif
-
-
-///@TODO add this as an optimization when upgrading mono, used by MonoStringNewLength:
-/// mono_string_new_len      (MonoDomain *domain, const char *text, guint length);
 
 // Profiler
 #if ENABLE_MONO
@@ -444,9 +408,6 @@ DO_API(void, mono_profiler_install_enter_leave, (MonoProfileMethodFunc enter, Mo
 DO_API(void, mono_profiler_install_allocation, (MonoProfileAllocFunc callback))
 DO_API(void, mono_profiler_install_jit_end, (MonoProfileJitResult jit_end))
 DO_API(void, mono_profiler_install_thread, (MonoProfileThreadFunc start, MonoProfileThreadFunc end))
-//DO_API(void, mono_gc_base_init, ())
-//DO_API(void, mono_profiler_install_statistical, (MonoProfileStatFunc callback))
-//DO_API(void, mono_profiler_install_statistical_call_chain, (MonoProfileStatCallChainFunc callback, int call_chain_depth))
 
 #if LOAD_MONO_DYNAMICALLY
 DO_API_OPTIONAL(void, mono_profiler_set_thread_name_callback, (void *handle, MonoProfileThreadNameFunc callback))
@@ -469,7 +430,6 @@ DO_API_OPTIONAL(void, mono_profiler_set_domain_unloaded_callback, (void *handle,
 #endif
 #endif
 
-#if !USE_CONSOLEBRANCH_MONO
 typedef void(*MonoDataFunc) (void *data, void *userData);
 typedef void(*MonoClassFunc) (MonoClass *klass, void *userData);
 
@@ -494,57 +454,18 @@ DO_API(void*, mono_unity_vtable_get_static_field_data, (MonoVTable * vTable))
 DO_API(void, mono_unity_class_for_each, (MonoClassFunc callback, void* userData))
 DO_API(void, mono_unity_stop_gc_world, ())
 DO_API(void, mono_unity_start_gc_world, ())
-#endif
 
-#if !PLATFORM_XBOXONE
 DO_API(MonoManagedMemorySnapshot*, mono_unity_capture_memory_snapshot, ());
 DO_API(void, mono_unity_free_captured_memory_snapshot, (MonoManagedMemorySnapshot * snapshot));
-#endif
-
-#if PLATFORM_IOS || PLATFORM_TVOS
-DO_API(void, mono_aot_register_module, (void *aot_info))
-#endif
 
 // GLib functions
-#if !USE_CONSOLEBRANCH_MONO
 #define g_free mono_unity_g_free
 DO_API(void, mono_unity_g_free, (void* p))
-#elif PLATFORM_XBOXONE
-#define g_free free
-#else
-#define g_free console_g_free
-DO_API(void, console_g_free, (void* p))
-#endif
-/*
-#if PLATFORM_ANDROID
-static inline char   *g_strdup (const char *str) { if (str) {return strdup (str);} return NULL; }
-#define g_mem_set_vtable(x)
-#else
-DO_API(char*,g_strdup,(const char *image))
-DO_API(void,g_mem_set_vtable,(gpointer vtable))
-#endif*/
 
-
-//DO_API(void,macosx_register_exception_handler,())
 typedef UNUSED_SYMBOL void (*MonoLogCallback) (const char *log_domain, const char *log_level, const char *message, bool fatal, void *user_data);
 DO_API(void, mono_trace_set_log_handler, (MonoLogCallback callback, void *user_data))
 DO_API(void, mono_trace_set_level_string, (const char *value))
 DO_API(void, mono_trace_set_mask_string, (const char *value))
-#if PLATFORM_XBOXONE
-DO_API(void, mono_trace_set_level, (GLogLevelFlags level));
-#endif
-
-#if PLATFORM_XBOXONE
-DO_API(void, mono_trace_enable, (gboolean enable));
-#endif
-
-#if PLATFORM_XBOXONE
-DO_API(void, mono_jit_set_aot_only, (gboolean val))
-#endif
-
-#if PLATFORM_XBOXONE
-DO_API(void, mono_runtime_set_main_args, (const char** args, int num_args))
-#endif
 
 #if PLATFORM_OSX
 DO_API(int, mono_unity_backtrace_from_context, (void* context, void* array[], int count))
@@ -560,31 +481,16 @@ DO_API(char *, mono_debug_print_stack_frame, (MonoMethod * method, guint32 nativ
 #endif
 
 #if ENABLE_MONO_MEMORY_CALLBACKS
-#if USE_CONSOLEBRANCH_MONO
-DO_API(void, unity_mono_install_memory_callbacks, (MonoMemoryCallbacks * callbacks))
-#else
 DO_API(void, mono_unity_install_memory_callbacks, (MonoMemoryCallbacks * callbacks))
-#endif
-#endif
-
-#if PLATFORM_PS4
-DO_API(void, unity_mono_set_thread_affinity, (int aff))
-DO_API(void, unity_mono_set_thread_policy, (int type, int policy))
 #endif
 
 #if UNITY_EDITOR
 typedef UNUSED_SYMBOL size_t(*RemapPathFunction)(const char* path, char* buffer, size_t buffer_len);
 DO_API(void, mono_unity_register_path_remapper, (RemapPathFunction func))
-#endif
-
-#if UNITY_EDITOR
 DO_API_OPTIONAL(void, mono_unity_set_enable_handler_block_guards, (gboolean allow))
 #endif
 
-// Not defined in mono-consoles
-#if !USE_CONSOLEBRANCH_MONO
 DO_API_OPTIONAL(void, mono_unity_install_unitytls_interface, (void* callbacks))
-#endif
 
 #if ENABLE_OUT_OF_PROCESS_CRASH_HANDLER && UNITY_64 && PLATFORM_WIN && ENABLE_MONO && !PLATFORM_XBOXONE
 DO_API_OPTIONAL(void*, mono_unity_lock_dynamic_function_access_tables64, (unsigned int))
@@ -605,6 +511,8 @@ DO_API_OPTIONAL(gboolean, mono_debugger_get_generate_debug_info, ())
 DO_API_OPTIONAL(void, mono_debugger_disconnect, ())
 typedef void (*MonoDebuggerAttachFunc)(gboolean attached);
 DO_API_OPTIONAL(void, mono_debugger_install_attach_detach_callback, (MonoDebuggerAttachFunc func))
+typedef UNUSED_SYMBOL void (*UnityLogErrorCallback) (const char* message);
+DO_API(void, mono_unity_set_editor_logging_callback, (UnityLogErrorCallback callback))
 #endif
 
 #if ENABLE_CORECLR

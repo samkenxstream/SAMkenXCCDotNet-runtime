@@ -69,9 +69,9 @@ CrstStatic g_gc_handles_lock;
 CrstStatic g_add_internal_lock;
 
 #define MONO_MAX_PATH 4096
-char s_AssemblyDir[MONO_MAX_PATH] = { 0 };
-char s_EtcDir[MONO_MAX_PATH] = { 0 };
-char s_AssemblyPaths[4096] = { 0 };
+static SString* s_AssemblyDir;
+static SString* s_EtcDir;
+static SString* s_AssemblyPaths;
 
 // Import this function manually as it is not defined in a header
 extern "C" HRESULT  GetCLRRuntimeHost(REFIID riid, IUnknown **ppUnk);
@@ -324,12 +324,6 @@ extern "C" EXPORT_API void mono_verifier_set_mode(MiniVerifierMode)
     //TODO used in Runtime\Mono\MonoManager.cpp SetSecurityMode()
 }
 
-extern "C" EXPORT_API void mono_security_set_mode(MonoSecurityMode)
-{
-    // NOP
-    //TODO used in Runtime\Mono\MonoManager.cpp SetSecurityMode()
-}
-
 struct MonoInternalCallFrame
 {
     FrameWithCookie<HelperMethodFrame> frame;
@@ -416,7 +410,7 @@ extern "C" EXPORT_API MonoDomain* mono_jit_init(const char *file)
     return mono_jit_init_version(file, "4.0");
 }
 
-void list_tpa(const wchar_t* searchPath, SString& tpa)
+void list_tpa(const SString& searchPath, SString& tpa)
 {
     SString searchPattern = searchPath;
     searchPattern += W("/*.dll");
@@ -427,12 +421,9 @@ void list_tpa(const wchar_t* searchPath, SString& tpa)
     {
         do
         {
-            wchar_t pathToAdd[MONO_MAX_PATH];
-            wcscpy_s(pathToAdd, MONO_MAX_PATH, searchPath);
-            wcscat_s(pathToAdd, MONO_MAX_PATH, W("/"));
-            wcscat_s(pathToAdd, MONO_MAX_PATH, findData.cFileName);
-
-            tpa += pathToAdd;
+            tpa.Append(searchPath);
+            tpa.Append(W("/"));
+            tpa.Append(findData.cFileName);
             tpa += PATH_SEPARATOR;
         } while (FindNextFileW(fileHandle, &findData));
         FindClose(fileHandle);
@@ -442,10 +433,10 @@ void list_tpa(const wchar_t* searchPath, SString& tpa)
 void SetupDomainPaths(MonoObject *alcObject)
 {
     bool isSystemPath = true;
-    void* params[2] = { mono_string_new_wrapper(s_AssemblyDir), &isSystemPath};
+    void* params[2] = { mono_string_from_utf16((const gunichar2*)s_AssemblyDir->GetUnicode()), &isSystemPath};
     mono_runtime_invoke(gALCWrapperAddPathMethod, alcObject, params, NULL);
     isSystemPath = false;
-    params[0] = mono_string_new_wrapper(s_AssemblyPaths);
+    params[0] = mono_string_from_utf16((const gunichar2*)s_AssemblyPaths->GetUnicode());
     mono_runtime_invoke(gALCWrapperAddPathMethod, alcObject, params, NULL);
 }
 
@@ -512,21 +503,18 @@ extern "C" EXPORT_API MonoDomain* mono_jit_init_version(const char *file, const 
             return nullptr;
         }
 
-        const wchar_t *property_keys[] = {
+        LPCWSTR property_keys[] = {
             W("TRUSTED_PLATFORM_ASSEMBLIES"),
             W("APP_PATHS"),
             W("APP_NI_PATHS"),
             W("NATIVE_DLL_SEARCH_DIRECTORIES")
         };
 
-        wchar_t appPath[MONO_MAX_PATH] = { 0 };
-        Wsz_mbstowcs(appPath, s_AssemblyDir, MONO_MAX_PATH);
+        SString appPath (*s_AssemblyDir);
 
-        wchar_t etcPath[MONO_MAX_PATH] = { 0 };
-        Wsz_mbstowcs(etcPath, s_EtcDir, MONO_MAX_PATH);
+        SString etcPath (*s_EtcDir);
 
-        wchar_t assemblyPaths[4096] = { 0 };
-        Wsz_mbstowcs(assemblyPaths, s_AssemblyPaths, 4096);
+        SString assemblyPaths (*s_AssemblyPaths);
 
         SString tpa;
         list_tpa(appPath, tpa);
@@ -546,20 +534,18 @@ extern "C" EXPORT_API MonoDomain* mono_jit_init_version(const char *file, const 
         nativeDllSearchDirs += PATH_SEPARATOR;
         nativeDllSearchDirs += etcPath;
 
-        const wchar_t *property_values[] = {
+        LPCWSTR property_values[] = {
                   tpa.GetUnicode(),
                   appPaths,
                   appNiPaths.GetUnicode(),
                   nativeDllSearchDirs.GetUnicode()
         };
 
-        // TODO: This is not safe
-        wchar_t  wfile[MONO_MAX_PATH];
-        Wsz_mbstowcs(wfile, file, MONO_MAX_PATH); // check if null terminated
+        SString  wfile(SString::Utf8, file);
 
         DWORD domainId;
         hr = host->CreateAppDomainWithManager(
-            wfile,   // The friendly name of the AppDomain
+            wfile.GetUnicode(),   // The friendly name of the AppDomain
                      // Flags:
                      // APPDOMAIN_ENABLE_PLATFORM_SPECIFIC_APPS
                      // - By default CoreCLR only allows platform neutral assembly to be run. To allow
@@ -579,7 +565,7 @@ extern "C" EXPORT_API MonoDomain* mono_jit_init_version(const char *file, const 
             APPDOMAIN_DISABLE_TRANSPARENCY_ENFORCEMENT,
             NULL,                // Name of the assembly that contains the AppDomainManager implementation
             NULL,                    // The AppDomainManager implementation type name
-            sizeof(property_keys) / sizeof(wchar_t*),  // The number of properties
+            sizeof(property_keys) / sizeof(LPCWSTR),  // The number of properties
             property_keys,
             property_values,
             &domainId);
@@ -593,17 +579,13 @@ extern "C" EXPORT_API MonoDomain* mono_jit_init_version(const char *file, const 
     AppDomain *pCurDomain = SystemDomain::GetCurrentDomain();
     
     Assembly* coreClrHelperAssembly = NULL;
-    char *assemblyPaths = _strdup(s_AssemblyPaths);
-    char *assemblyPathsPtr = assemblyPaths;
-    while (assemblyPaths)
+    SString::CIterator iter = s_AssemblyPaths->Begin();
+    while (iter != s_AssemblyPaths->End())
     {
-        char* next = strchr(assemblyPaths, PATH_SEPARATOR);
-        if (next)
-        {
-            *next = '\0';
-            next++;
-        }
-        SString assemblyPath(SString::Utf8, assemblyPaths);
+        SString::CIterator next = iter;
+        s_AssemblyPaths->Find(next, PATH_SEPARATOR);
+
+        SString assemblyPath(*s_AssemblyPaths, iter, next);
         assemblyPath += '/';
         assemblyPath += SString(SString::Utf8, kCoreCLRHelpersDll);
         
@@ -622,10 +604,9 @@ extern "C" EXPORT_API MonoDomain* mono_jit_init_version(const char *file, const 
         if (coreClrHelperAssembly != NULL)
             break;
 
-        assemblyPaths = next;
+        iter = next;
     }
 
-    free(assemblyPathsPtr);
     coreClrHelperAssembly->EnsureActive();
     gCoreCLRHelperAssembly = (MonoImage*)coreClrHelperAssembly;
     gALCWrapperClass = mono_class_from_name(gCoreCLRHelperAssembly, "Unity.CoreCLRHelpers", "ALCWrapper");
@@ -1117,24 +1098,30 @@ extern "C" EXPORT_API void mono_set_gc_conservative(bool conservative)
     //g_pConfig->SetGCConservative(conservative);
 }
 
-#if UNITY_SUPPORT_DOMAIN_UNLOAD
 extern "C" EXPORT_API void mono_domain_unload(MonoDomain* domain)
 {
     TRACE_API("%p", domain);
+    
+#if UNITY_SUPPORT_DOMAIN_UNLOAD
 
     domain_unload(domain);
+#else
+    ASSERT_NOT_IMPLEMENTED;
+#endif
 }
 
 extern "C" EXPORT_API void mono_unity_domain_unload(MonoDomain * domain, MonoUnityExceptionFunc callback)
 {
     TRACE_API("%p %p", domain, callback);
-
+    
+#if UNITY_SUPPORT_DOMAIN_UNLOAD
     MonoObject *exc = domain_unload(domain);
     if (exc)
         callback(exc);
-}
-
+#else
+    ASSERT_NOT_IMPLEMENTED;
 #endif
+}
 
 extern "C" EXPORT_API MonoObject* mono_object_new(MonoDomain *domain, MonoClass *klass)
 {
@@ -2704,7 +2691,7 @@ extern "C" EXPORT_API void mono_unity_set_embeddinghostname(const char* name)
 
 extern "C" EXPORT_API void mono_set_assemblies_path(const char* name)
 {
-    strcpy(s_AssemblyPaths, name);
+    s_AssemblyPaths = new SString(SString::Utf8, name);
 }
 
 
@@ -2896,8 +2883,10 @@ extern "C" EXPORT_API void mono_gc_collect(int generation)
     FCALL_CONTRACT;
     _ASSERTE(generation >= -1);
     GCX_COOP();
+#if 0
     if (mono_unity_gc_is_disabled())
         return;
+#endif
     GCHeapUtilities::GetGCHeap()->GarbageCollect(generation, false, collection_blocking);
 }
 
@@ -3254,8 +3243,8 @@ extern "C" EXPORT_API void mono_config_parse(const char *filename)
 
 extern "C" EXPORT_API void mono_set_dirs(const char *assembly_dir, const char *config_dir)
 {
-    strcpy(s_AssemblyDir, assembly_dir);
-    strcpy(s_EtcDir, assembly_dir);
+    s_AssemblyDir = new SString(SString::Utf8, assembly_dir);
+    s_EtcDir = new SString(SString::Utf8, config_dir);
 }
 
 //DO_API(void,ves_icall_System_AppDomain_InternalUnload,(int domain_id))
@@ -3704,7 +3693,7 @@ extern "C" EXPORT_API void mono_unity_set_vprintf_func(vprintf_func func)
     ASSERT_NOT_IMPLEMENTED;
 }
 
-extern "C" EXPORT_API void* mono_unity_liveness_allocate_struct(MonoClass* filter, int max_object_count, mono_register_object_callback callback, void* userdata)
+extern "C" EXPORT_API void* mono_unity_liveness_allocate_struct(MonoClass* filter, int max_object_count, mono_register_object_callback callback, void* userdata, mono_liveness_reallocate_callback reallocate)
 {
     ASSERT_NOT_IMPLEMENTED;
     return NULL;
@@ -3955,18 +3944,14 @@ extern "C" EXPORT_API void mono_gc_wbarrier_set_field (MonoObject * obj, gpointe
 
 extern "C" EXPORT_API void mono_set_assemblies_path_null_separated (const char* name)
 {
-    char *assemblyPaths = s_AssemblyPaths;
+    s_AssemblyPaths = new SString();
     while (*name != NULL)
     {
         size_t l = strlen(name);
-        strcpy(assemblyPaths, name);
-        assemblyPaths[l] = PATH_SEPARATOR;
-        assemblyPaths += l;
+        s_AssemblyPaths->AppendUTF8(name);
+        s_AssemblyPaths->AppendUTF8(PATH_SEPARATOR);
         name += l+1;
-        if (*name != NULL)
-            assemblyPaths++;
     }
-    *assemblyPaths = NULL;
 }
 
 extern "C" EXPORT_API gint64 mono_gc_get_max_time_slice_ns ()
@@ -4150,4 +4135,106 @@ void fire_mono_gc_resume_callback()
 {
     if (gc_func)
         gc_func(NULL, 9, 0);
+}
+
+extern "C" EXPORT_API void mono_dllmap_insert(MonoImage * assembly, const char *dll, const char *func, const char *tdll, const char *tfunc)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+extern "C" EXPORT_API MonoClassField* mono_field_from_token(MonoImage * image, uint32_t token, MonoClass** retklass, MonoGenericContext * context)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+extern "C" EXPORT_API MonoReflectionField* mono_field_get_object(MonoDomain * domain, MonoClass * klass, MonoClassField * field)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+//extern "C" EXPORT_API void mono_gchandle_free_v2()
+//{
+//    ASSERT_NOT_IMPLEMENTED;
+//}
+//extern "C" EXPORT_API void mono_gchandle_get_target_v2()
+//{
+//    ASSERT_NOT_IMPLEMENTED;
+//}
+//extern "C" EXPORT_API void mono_gchandle_is_in_domain_v2()
+//{
+//    ASSERT_NOT_IMPLEMENTED;
+//}
+//extern "C" EXPORT_API void mono_gchandle_new_v2()
+//{
+//    ASSERT_NOT_IMPLEMENTED;
+//}
+//extern "C" EXPORT_API void mono_gchandle_new_weakref_v2()
+//{
+//    ASSERT_NOT_IMPLEMENTED;
+//}
+extern "C" EXPORT_API MonoMethod* mono_get_method(MonoImage * image, guint32 token, MonoClass * klass)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+extern "C" EXPORT_API const MonoTableInfo* mono_image_get_table_info(MonoImage * image, int table_id)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+extern "C" EXPORT_API const char* mono_image_strerror(int status)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+extern "C" EXPORT_API void mono_metadata_decode_row(const MonoTableInfo * t, int idx, guint32 * res, int res_size)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+extern "C" EXPORT_API MonoMethodSignature* mono_method_signature_checked_slow(MonoMethod * method, MonoError * error)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+//extern "C" EXPORT_API void mono_object_get_domain()
+//{
+//    ASSERT_NOT_IMPLEMENTED;
+//}
+extern "C" EXPORT_API gboolean mono_thread_has_sufficient_execution_stack(void)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return FALSE;
+}
+extern "C" EXPORT_API gboolean mono_unity_class_has_failure(MonoClass * klass)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return FALSE;
+}
+extern "C" EXPORT_API gboolean mono_unity_class_is_open_constructed_type(MonoClass * klass)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return FALSE;
+}
+extern "C" EXPORT_API MonoArray* mono_unity_custom_attrs_construct(MonoCustomAttrInfo * cinfo, MonoError * error)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+extern "C" EXPORT_API MonoException* mono_unity_error_convert_to_exception(MonoError * error)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+extern "C" EXPORT_API MonoClassField* mono_unity_field_from_token_checked(MonoImage * image, guint32 token, MonoClass** retklass, MonoGenericContext * context, MonoError * error)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return NULL;
+}
+extern "C" EXPORT_API void mono_unity_gc_set_mode(MonoGCMode mode)
+{
+    ASSERT_NOT_IMPLEMENTED;
+}
+extern "C" EXPORT_API int mono_unity_managed_callstack(unsigned char* buffer, int bufferSize, const MonoUnityCallstackOptions * opts)
+{
+    ASSERT_NOT_IMPLEMENTED;
+    return 0;
 }
