@@ -1734,6 +1734,13 @@ MethodTableBuilder::BuildMethodTableThrowing(
             HandleExplicitLayout(pByValueClassCache);
         }
     }
+#ifdef FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+    else if (IsSequentialWithRefs() && !bmtGenerics->fContainsGenericVariables)
+    {
+        _ASSERTE(HasLayout());
+        HandleExplicitLayout(pByValueClassCache);
+    }
+#endif
     else
     {
         _ASSERTE(!IsBlittable());
@@ -1828,6 +1835,10 @@ MethodTableBuilder::BuildMethodTableThrowing(
     if (HasExplicitFieldOffsetLayout())
         // Perform relevant GC calculations for tdexplicit
         HandleGCForExplicitLayout();
+#ifdef FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+    else if (IsSequentialWithRefs())
+        HandleGCForExplicitLayout();
+#endif
     else
         // Perform relevant GC calculations for value classes
         HandleGCForValueClasses(pByValueClassCache);
@@ -4252,6 +4263,15 @@ VOID    MethodTableBuilder::InitializeFieldDescs(FieldDesc *pFieldDescList,
 
                 IfFailThrow(pFD->SetOffset(pLayoutFieldInfo->m_placement.m_offset));
             }
+#ifdef FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+            else if (!fIsStatic && IsSequentialWithRefs())
+            {
+                (DWORD_PTR &)pFD->m_pMTOfEnclosingClass =
+                    (*pByValueClassCache)[dwCurrentDeclaredField]->GetNumInstanceFieldBytes();
+
+                IfFailThrow(pFD->SetOffset(pLayoutFieldInfo->m_placement.m_offset));
+            }
+#endif
             else
             {
                 // static value class fields hold a handle, which is ptr sized
@@ -4274,6 +4294,10 @@ VOID    MethodTableBuilder::InitializeFieldDescs(FieldDesc *pFieldDescList,
                 IfFailThrow(pFD->SetOffset(pLayoutFieldInfo->m_placement.m_offset));
             else if (IsManagedSequential() && !fIsStatic)
                 IfFailThrow(pFD->SetOffset(pLayoutFieldInfo->m_placement.m_offset));
+#ifdef FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+            else if (IsSequentialWithRefs() && !fIsStatic)
+                IfFailThrow(pFD->SetOffset(pLayoutFieldInfo->m_placement.m_offset));
+#endif
             else if (bCurrentFieldIsGCPointer)
                 pFD->SetOffset(FIELD_OFFSET_UNPLACED_GC_PTR);
             else
@@ -8258,7 +8282,14 @@ DWORD MethodTableBuilder::GetFieldSize(FieldDesc *pFD)
 
         // We should only be calling this while this class is being built.
     _ASSERTE(GetHalfBakedMethodTable() == 0);
-    BAD_FORMAT_NOTHROW_ASSERT(! pFD->IsByValue() || HasExplicitFieldOffsetLayout());
+
+
+#ifdef FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+    BAD_FORMAT_NOTHROW_ASSERT(! pFD->IsByValue() || HasExplicitFieldOffsetLayout() || IsSequentialWithRefs() );
+#else
+    BAD_FORMAT_NOTHROW_ASSERT(! pFD->IsByValue() || HasExplicitFieldOffsetLayout() );
+#endif
+
 
     if (pFD->IsByValue())
         return (DWORD)(DWORD_PTR&)(pFD->m_pMTOfEnclosingClass);

@@ -104,6 +104,7 @@ namespace Internal.TypeSystem
                     type.Context.Target.GetWellKnownTypeAlignment(type),
                     0,
                     alignUpInstanceByteSize: true,
+                    ignoreLayoutAlignment: false,
                     out instanceByteSizeAndAlignment
                     );
 
@@ -302,7 +303,7 @@ namespace Internal.TypeSystem
             LayoutInt instanceSize = cumulativeInstanceFieldPos + offsetBias;
 
             var layoutMetadata = type.GetClassLayout();
-            int packingSize = ComputePackingSize(type, layoutMetadata);
+            int packingSize = ComputePackingSize(type, layoutMetadata, false);
             LayoutInt largestAlignmentRequired = LayoutInt.One;
 
             var offsets = new FieldAndOffset[numInstanceFields];
@@ -356,6 +357,7 @@ namespace Internal.TypeSystem
                 largestAlignmentRequired,
                 layoutMetadata.Size,
                 alignUpInstanceByteSize: AlignUpInstanceByteSizeForExplicitFieldLayoutCompatQuirk(type),
+                ignoreLayoutAlignment: false,
                 out instanceByteSizeAndAlignment);
 
             ComputedInstanceFieldLayout computedLayout = new ComputedInstanceFieldLayout();
@@ -376,7 +378,7 @@ namespace Internal.TypeSystem
             return LayoutInt.AlignUp(cumulativeInstanceFieldPos, alignment, target);
         }
 
-        protected ComputedInstanceFieldLayout ComputeSequentialFieldLayout(MetadataType type, int numInstanceFields)
+        protected ComputedInstanceFieldLayout ComputeSequentialFieldLayout(MetadataType type, int numInstanceFields, bool isSequentialWithRefs)
         {
             var offsets = new FieldAndOffset[numInstanceFields];
 
@@ -390,7 +392,7 @@ namespace Internal.TypeSystem
 
             LayoutInt largestAlignmentRequirement = LayoutInt.One;
             int fieldOrdinal = 0;
-            int packingSize = ComputePackingSize(type, layoutMetadata);
+            int packingSize = ComputePackingSize(type, layoutMetadata, ignoreLayoutPacking: isSequentialWithRefs);
             bool layoutAbiStable = true;
 
             foreach (var field in type.GetFields())
@@ -418,6 +420,7 @@ namespace Internal.TypeSystem
                 largestAlignmentRequirement,
                 layoutMetadata.Size,
                 alignUpInstanceByteSize: true,
+                ignoreLayoutAlignment: isSequentialWithRefs,
                 out instanceByteSizeAndAlignment);
 
             ComputedInstanceFieldLayout computedLayout = new ComputedInstanceFieldLayout();
@@ -442,7 +445,7 @@ namespace Internal.TypeSystem
             bool hasLayout = type.HasLayout();
             var layoutMetadata = type.GetClassLayout();
 
-            int packingSize = ComputePackingSize(type, layoutMetadata);
+            int packingSize = ComputePackingSize(type, layoutMetadata, false);
             packingSize = Math.Min(context.Target.MaximumAutoLayoutPackingSize, packingSize);
 
             var offsets = new FieldAndOffset[numInstanceFields];
@@ -706,6 +709,7 @@ namespace Internal.TypeSystem
                 minAlign,
                 classLayoutSize: 0,
                 alignUpInstanceByteSize: true,
+                ignoreLayoutAlignment: false,
                 out instanceByteSizeAndAlignment);
 
             ComputedInstanceFieldLayout computedLayout = new ComputedInstanceFieldLayout();
@@ -828,15 +832,15 @@ namespace Internal.TypeSystem
             return result;
         }
 
-        private static int ComputePackingSize(MetadataType type, ClassLayoutMetadata layoutMetadata)
+        private static int ComputePackingSize(MetadataType type, ClassLayoutMetadata layoutMetadata, bool ignoreLayoutPacking)
         {
-            if (layoutMetadata.PackingSize == 0)
+            if (layoutMetadata.PackingSize == 0 || ignoreLayoutPacking)
                 return type.Context.Target.DefaultPackingSize;
             else
                 return layoutMetadata.PackingSize;
         }
 
-        private static SizeAndAlignment ComputeInstanceSize(MetadataType type, LayoutInt instanceSize, LayoutInt alignment, int classLayoutSize, bool alignUpInstanceByteSize, out SizeAndAlignment byteCount)
+        private static SizeAndAlignment ComputeInstanceSize(MetadataType type, LayoutInt instanceSize, LayoutInt alignment, int classLayoutSize, bool alignUpInstanceByteSize, bool ignoreLayoutAlignment, out SizeAndAlignment byteCount)
         {
             SizeAndAlignment result;
 
@@ -862,6 +866,16 @@ namespace Internal.TypeSystem
             }
             else
             {
+#if FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+                if (ignoreLayoutAlignment)
+                {
+                    // Even if we want to ignore layout alignment, the GC requires types with GC refs to be
+                    // sized to a multiple of LayoutPointerSize
+                    if (type.ContainsGCPointers)
+                        instanceSize = LayoutInt.AlignUp(instanceSize, target.LayoutPointerSize, target);
+                }
+                else
+#endif
                 if (type.IsValueType)
                 {
                     instanceSize = LayoutInt.AlignUp(instanceSize,

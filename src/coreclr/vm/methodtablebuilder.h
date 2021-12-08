@@ -230,6 +230,9 @@ private:
     BOOL HasExplicitFieldOffsetLayout() { WRAPPER_NO_CONTRACT; return GetHalfBakedClass()->HasExplicitFieldOffsetLayout(); }
     BOOL IsManagedSequential() { WRAPPER_NO_CONTRACT; return GetHalfBakedClass()->IsManagedSequential(); }
     BOOL HasExplicitSize() { WRAPPER_NO_CONTRACT; return GetHalfBakedClass()->HasExplicitSize(); }
+#ifdef FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+    BOOL IsSequentialWithRefs() { WRAPPER_NO_CONTRACT; return GetHalfBakedClass()->IsSequentialWithRefs(); }
+#endif
 
 #ifdef _DEBUG
     LPCUTF8 GetDebugClassName() { WRAPPER_NO_CONTRACT; return GetHalfBakedClass()->GetDebugClassName(); }

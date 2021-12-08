@@ -29,7 +29,9 @@ typedef struct
     I4Array * largeResult;
     int length;
 #ifdef HOST_64BIT
+#ifndef FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
     int padding;
+#endif
 #endif
     int smallResult[16];
 } MetadataEnumResult;

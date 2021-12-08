@@ -803,9 +803,9 @@ namespace ILCompiler
                 return ComputeExplicitFieldLayout(type, numInstanceFields);
             }
             else
-            if (type.IsEnum || MarshalUtils.IsBlittableType(type) || IsManagedSequentialType(type))
+            if (ShouldLayoutSequential(type, out var isSequentialWithRefs))
             {
-                return ComputeSequentialFieldLayout(type, numInstanceFields);
+                return ComputeSequentialFieldLayout(type, numInstanceFields, isSequentialWithRefs);
             }
             else
             {
@@ -865,5 +865,61 @@ namespace ILCompiler
 
             return true;
         }
+
+        private static bool ShouldLayoutSequential(TypeDesc type, out bool isSequentialWithRefs)
+        {
+            isSequentialWithRefs = false;
+
+            var name = type.GetDisplayName();
+
+            if (type.IsEnum)
+            {
+                return true;
+            }
+
+            if (MarshalUtils.IsBlittableType(type))
+            {
+                return true;
+            }
+
+            if (IsManagedSequentialType(type))
+            {
+                return true;
+            }
+
+#if !FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+            return false;
+        }
+#else
+            isSequentialWithRefs = HasValidSequentialLayout(type);
+            return isSequentialWithRefs;
+        }
+
+        private static bool HasValidSequentialLayout(TypeDesc type)
+        {
+            var metadataType = type as MetadataType;
+            if (metadataType == null)
+            {
+                return false;
+            }
+
+            if (!metadataType.IsSequentialLayout)
+            {
+                return false;
+            }
+
+            if (!metadataType.HasBaseType)
+            {
+                return false;
+            }
+
+            if (metadataType.BaseType.IsObject || metadataType.BaseType.IsWellKnownType(WellKnownType.ValueType))
+            {
+                return true;
+            }
+
+            return HasValidSequentialLayout(type.BaseType);
+        }
+#endif
     }
 }

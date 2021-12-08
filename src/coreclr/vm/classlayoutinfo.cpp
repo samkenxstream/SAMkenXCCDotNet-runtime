@@ -710,6 +710,16 @@ VOID EEClassLayoutInfo::CollectLayoutFieldMetadataThrowing(
     }
 
     pEEClassLayoutInfoOut->SetIsManagedSequential(!fDisqualifyFromManagedSequential);
+
+#ifdef FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+    BOOL fIsSequentialWithRefs = FALSE;
+    if (fDisqualifyFromManagedSequential && !fExplicitOffsets)
+    {
+        fIsSequentialWithRefs = !fHasNonTrivialParent || (fParentHasLayout && (pParentLayoutInfo->IsSequentialWithRefs() || pParentLayoutInfo->IsManagedSequential() || pParentLayoutInfo->IsBlittable()));
+    }
+
+    pEEClassLayoutInfoOut->SetIsSequentialWithRefs(fIsSequentialWithRefs);
+#endif
 }
 
 void EEClassNativeLayoutInfo::InitializeNativeLayoutFieldMetadataThrowing(MethodTable* pMT)

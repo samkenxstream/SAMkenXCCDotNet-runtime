@@ -17,6 +17,10 @@
     <Configurations>Debug;Release;Checked</Configurations>
   </PropertyGroup>
 
+  <!-- Compilation options -->
+  <Import Project="../../../clr.featuredefines.props" />
+
+
   <ItemGroup>
     <ProjectReference Include="..\ILCompiler.DependencyAnalysisFramework\ILCompiler.DependencyAnalysisFramework.csproj" />
     <ProjectReference Include="..\ILCompiler.Diagnostics\ILCompiler.Diagnostics.csproj" />

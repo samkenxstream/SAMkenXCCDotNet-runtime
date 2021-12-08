@@ -39,7 +39,7 @@ namespace TypeSystemTests
             }
             else if (type.IsSequentialLayout || type.IsEnum)
             {
-                return ComputeSequentialFieldLayout(type, numInstanceFields);
+                return ComputeSequentialFieldLayout(type, numInstanceFields, false);
             }
             else
             {

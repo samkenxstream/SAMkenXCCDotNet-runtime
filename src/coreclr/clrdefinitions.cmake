@@ -219,6 +219,9 @@ if (CLR_CMAKE_TARGET_WIN32 AND CLR_CMAKE_TARGET_ARCH_AMD64)
   add_definitions(-DFEATURE_SPECIAL_USER_MODE_APC)
 endif()
 
+if (FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS)
+    add_definitions(-DFEATURE_SEQUENTIAL_LAYOUT_WITH_REFS)
+endif()
 
 # Use this function to enable building with a specific target OS and architecture set of defines
 # This is known to work for the set of defines used by the JIT and gcinfo, it is not likely correct for

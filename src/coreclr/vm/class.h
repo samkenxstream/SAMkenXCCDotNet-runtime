@@ -376,6 +376,11 @@ class EEClassLayoutInfo
             e_ZERO_SIZED                =   0x04,
             // The size of the struct is explicitly specified in the meta-data.
             e_HAS_EXPLICIT_SIZE         = 0x08
+
+#ifdef FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+            // The type has GC references, but respect sequential layout
+            , e_SEQUENTIAL_WITH_REFS = 0x10
+#endif
         };
 
         BYTE        m_bFlags;
@@ -419,6 +424,14 @@ class EEClassLayoutInfo
             return (m_bFlags & e_HAS_EXPLICIT_SIZE) == e_HAS_EXPLICIT_SIZE;
         }
 
+#ifdef FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+        BOOL IsSequentialWithRefs() const
+        {
+            LIMITED_METHOD_CONTRACT;
+            return (m_bFlags & e_SEQUENTIAL_WITH_REFS) == e_SEQUENTIAL_WITH_REFS;
+        }
+#endif
+
         BYTE GetPackingSize() const
         {
             LIMITED_METHOD_CONTRACT;
@@ -452,6 +465,13 @@ class EEClassLayoutInfo
             LIMITED_METHOD_CONTRACT;
             m_bFlags = hasExplicitSize ? (m_bFlags | e_HAS_EXPLICIT_SIZE)
                                        : (m_bFlags & ~e_HAS_EXPLICIT_SIZE);
+        }
+
+        void SetIsSequentialWithRefs(BOOL isSequenialWithRefs)
+        {
+            LIMITED_METHOD_CONTRACT;
+            m_bFlags = isSequenialWithRefs ? (m_bFlags | e_SEQUENTIAL_WITH_REFS)
+                                           : (m_bFlags & ~e_SEQUENTIAL_WITH_REFS);
         }
 };
 
@@ -1382,6 +1402,10 @@ public:
 
     BOOL HasExplicitSize();
 
+#ifdef FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
+    BOOL IsSequentialWithRefs();
+#endif
+
     static void GetBestFitMapping(MethodTable * pMT, BOOL *pfBestFitMapping, BOOL *pfThrowOnUnmappableChar);
 
     /*
@@ -2060,6 +2084,12 @@ inline BOOL EEClass::HasExplicitSize()
 {
     LIMITED_METHOD_CONTRACT;
     return HasLayout() && GetLayoutInfo()->HasExplicitSize();
+}
+
+inline BOOL EEClass::IsSequentialWithRefs()
+{
+    LIMITED_METHOD_CONTRACT;
+    return HasLayout() && GetLayoutInfo()->IsSequentialWithRefs();
 }
 
 //==========================================================================

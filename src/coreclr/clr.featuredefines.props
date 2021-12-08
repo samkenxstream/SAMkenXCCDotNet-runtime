@@ -11,6 +11,7 @@
         <FeatureBasicFreeze>true</FeatureBasicFreeze>
         <FeatureGenericMath>true</FeatureGenericMath>
         <ProfilingSupportedBuild>true</ProfilingSupportedBuild>
+        <SequentialLayoutWithRefs>true</SequentialLayoutWithRefs>
     </PropertyGroup>
 
     <PropertyGroup Condition="'$(TargetsUnix)' == 'true'">
@@ -64,5 +65,6 @@
 
         <DefineConstants Condition="'$(ProfilingSupportedBuild)' == 'true'">$(DefineConstants);PROFILING_SUPPORTED</DefineConstants>
         <DefineConstants Condition="'$(FeatureProfAttach)' == 'true'">$(DefineConstants);FEATURE_PROFAPI_ATTACH_DETACH</DefineConstants>
+        <DefineConstants Condition="'$(SequentialLayoutWithRefs)' == 'true'">$(DefineConstants);FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS</DefineConstants>
     </PropertyGroup>
 </Project>
