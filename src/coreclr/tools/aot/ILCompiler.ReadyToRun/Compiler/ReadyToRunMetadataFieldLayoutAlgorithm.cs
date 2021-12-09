@@ -803,10 +803,17 @@ namespace ILCompiler
                 return ComputeExplicitFieldLayout(type, numInstanceFields);
             }
             else
+#if FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
             if (ShouldLayoutSequential(type, out var isSequentialWithRefs))
             {
                 return ComputeSequentialFieldLayout(type, numInstanceFields, isSequentialWithRefs);
             }
+#else
+            if (type.IsEnum || MarshalUtils.IsBlittableType(type) || IsManagedSequentialType(type))
+            {
+                return ComputeSequentialFieldLayout(type, numInstanceFields);
+            }
+#endif
             else
             {
                 return ComputeAutoFieldLayout(type, numInstanceFields);
@@ -866,6 +873,7 @@ namespace ILCompiler
             return true;
         }
 
+#if FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
         private static bool ShouldLayoutSequential(TypeDesc type, out bool isSequentialWithRefs)
         {
             isSequentialWithRefs = false;
@@ -887,10 +895,6 @@ namespace ILCompiler
                 return true;
             }
 
-#if !FEATURE_SEQUENTIAL_LAYOUT_WITH_REFS
-            return false;
-        }
-#else
             isSequentialWithRefs = HasValidSequentialLayout(type);
             return isSequentialWithRefs;
         }
