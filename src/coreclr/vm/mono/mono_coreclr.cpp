@@ -68,7 +68,6 @@ MonoDomain* CreateMonoDomainFromObject(MonoObject *o)
 CrstStatic g_gc_handles_lock;
 CrstStatic g_add_internal_lock;
 
-#define MONO_MAX_PATH 4096
 static SString* s_AssemblyDir;
 static SString* s_EtcDir;
 static SString* s_AssemblyPaths;
