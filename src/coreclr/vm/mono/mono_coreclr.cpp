@@ -1462,8 +1462,8 @@ extern "C" EXPORT_API MonoClass* mono_class_get_nested_types(MonoClass* klass, g
 
     CONTRACTL
     {
-        NOTHROW;
-    GC_NOTRIGGER;
+        THROWS; // new BYTE
+        GC_TRIGGERS; // ClassLoader::LoadTypeDefThrowing
     PRECONDITION(klass != NULL);
     }
     CONTRACTL_END;
