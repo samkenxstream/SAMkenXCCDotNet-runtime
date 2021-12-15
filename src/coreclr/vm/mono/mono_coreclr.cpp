@@ -604,6 +604,8 @@ extern "C" EXPORT_API MonoDomain* mono_jit_init_version(const char *file, const 
             break;
 
         iter = next;
+        if (iter != s_AssemblyPaths->End())
+            iter++;
     }
 
     coreClrHelperAssembly->EnsureActive();
