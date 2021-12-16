@@ -140,10 +140,13 @@ static void ScanStackRoots(Thread * pThread, promote_func* fn, ScanContext* sc)
             // scan the entire stack, including any native code.
             if (GetThread() != pThread)
             {
+                Thread::SuspendThreadResult str = pThread->SuspendThread();
+                _ASSERTE (str == Thread::STR_Success);
                 T_CONTEXT ctx;
                 REGDISPLAY rd;
                 if (pThread->InitRegDisplay(&rd, &ctx, FALSE))
                     topStack = (Object **)GetSP(&ctx);
+                pThread->ResumeThread();
             }
             else
                 topStack = (Object**)&topStack;
