@@ -3305,7 +3305,7 @@ MonoObject* CreateAttributeInstance(MonoCustomAttrInfo_clr* attributes, mdCustom
 
     DomainAssembly* domainAssembly = attributes->assembly->GetDomainAssembly();
 
-    MethodDesc* ctorMethod;
+    MethodDesc* ctorMethod = NULL;
     if (TypeFromToken(tkCtor) == mdtMemberRef)
     {
         MethodDesc * pMD = NULL;
