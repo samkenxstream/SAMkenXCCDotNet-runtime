@@ -1607,7 +1607,7 @@ extern "C" EXPORT_API void mono_class_set_userdata(MonoClass* klass, void* userd
 extern "C" EXPORT_API MonoDomain* mono_domain_get()
 {
     TRACE_API("", NULL);
-    return GetThread() != NULL ? gCurrentDomain : NULL;
+    return GetThreadNULLOk() != NULL ? gCurrentDomain : NULL;
 }
 
 extern "C" EXPORT_API MonoDomain* mono_get_root_domain()
@@ -2311,7 +2311,7 @@ extern "C" EXPORT_API gboolean unity_mono_method_is_inflated(MonoMethod* method)
 extern "C" EXPORT_API MonoThread * mono_thread_attach(MonoDomain *domain)
 {
     auto domain_clr = (MonoDomain_clr*)domain;
-    MonoThread_clr* currentThread = GetThread();
+    MonoThread_clr* currentThread = GetThreadNULLOk();
 
     if (currentThread == nullptr)
     {
