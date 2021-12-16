@@ -2254,6 +2254,12 @@ extern "C" EXPORT_API MonoObject* mono_type_get_object(MonoDomain *domain, MonoT
     return (MonoObject*) OBJECTREFToObject(clrType.GetManagedClassObject());
 }
 
+extern "C" EXPORT_API MonoClass* coreclr_class_from_systemtypeinstance (MonoObject* systemTypeInstance)
+{
+    ReflectClassBaseObject* refClass = (ReflectClassBaseObject*)systemTypeInstance;
+    return (MonoClass*)refClass->GetType().AsMethodTable();
+}
+
 extern "C" EXPORT_API gboolean mono_class_is_generic(MonoClass* klass)
 {
     CONTRACTL{

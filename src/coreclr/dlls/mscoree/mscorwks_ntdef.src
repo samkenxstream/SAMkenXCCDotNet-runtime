@@ -325,3 +325,4 @@ EXPORTS
         mono_unity_capture_memory_snapshot
         mono_unity_free_captured_memory_snapshot
         mono_trace_set_log_handler
+        coreclr_class_from_systemtypeinstance

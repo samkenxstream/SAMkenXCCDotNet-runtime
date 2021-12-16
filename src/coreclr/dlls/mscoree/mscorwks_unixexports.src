@@ -314,3 +314,4 @@ mono_error_ok
 mono_error_get_error_code
 mono_error_get_message
 mono_set_gc_conservative
+coreclr_class_from_systemtypeinstance
