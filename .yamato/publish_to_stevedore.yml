@@ -1,0 +1,22 @@
+name: 'Publish to Stevedore'
+
+agent:
+  type: Unity::VM
+  image: cds-ops/cds-ubuntu-18.04-base:stable
+  flavor: b1.large
+
+dependencies:
+  - .yamato/build_windows_x64.yml
+  - .yamato/build_and_test_osx_x64.yml
+  - .yamato/build_and_test_linux_x64.yml
+  
+commands:
+  - curl -sSo StevedoreUpload.exe "$STEVEDORE_UPLOAD_TOOL_URL"
+  - mv artifacts/packages/Release/Shipping/dotnet-runtime-7.0.0-dev-win-x64.zip artifacts/packages/Release/Shipping/dotnet-runtime-unity-win-x64.zip
+  - mono StevedoreUpload.exe --repo=testing --version-len=11 --version="$GIT_REVISION" artifacts/packages/Release/Shipping/dotnet-runtime-unity-win-x64.zip
+
+artifacts: 
+  stevedore:
+    paths:
+      - stevedore/artifactid.txt
+
