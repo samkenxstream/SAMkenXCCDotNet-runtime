@@ -59,7 +59,7 @@ namespace Unity.CoreCLRHelpers
         #if DEBUG_ALC_WRAPPER
             Console.WriteLine($"[ALCWrapper:#{id}] AddPath {inpaths} isSystemPath {isSystemPath}");
         #endif
-            foreach (var p in inpaths.Split(":"))
+            foreach (var p in inpaths.Split(Path.PathSeparator))
                 (isSystemPath ? systemPaths : userPaths).Add(p);
         }
 
