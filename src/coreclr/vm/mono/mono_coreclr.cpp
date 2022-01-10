@@ -441,6 +441,10 @@ void SetupDomainPaths(MonoObject *alcObject)
 
 extern "C" EXPORT_API MonoDomain* mono_jit_init_version(const char *file, const char* runtime_version)
 {
+#if defined(UNITYGC)
+    _putenv_s("ComPlus_GCName", "unitygc.dll");
+    SetEnvironmentVariableW(L"ComPlus_GCName", L"unitygc.dll");
+#endif
     g_gc_handles_lock.Init(CrstMonoHandles);
     g_add_internal_lock.Init(CrstMonoICalls);
 
