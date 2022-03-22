@@ -1599,8 +1599,8 @@ extern "C" EXPORT_API void EXPORT_CC mono_error_init (MonoError * error)
 extern "C" EXPORT_API MonoException* EXPORT_CC mono_exception_from_name_msg(MonoImage *image, const char *name_space, const char *name, const char *msg)
 {
     SString sstr(SString::Utf8, msg);
-    GCX_COOP();
     MonoClass *exclass = mono_class_from_name(image, name_space, name);
+    GCX_COOP();
     MonoObject *exobj = mono_object_new(mono_domain_get(), exclass);
     ((ExceptionObject*)exobj)->SetMessage(AllocateString(sstr));
     return (MonoException*)exobj;
