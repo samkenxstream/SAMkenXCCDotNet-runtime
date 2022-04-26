@@ -16,4 +16,5 @@ exit /b %errorlevel%
 
 goto :EOF
 :exit_error
+cd..
 exit /b %errorlevel%

@@ -493,6 +493,26 @@ namespace TestDll
             
             return null;
         }
+
+        internal unsafe ref struct StringHandleOnStack
+        {
+            private void* _ptr;
+
+            internal StringHandleOnStack(ref string? s)
+            {
+                _ptr = Unsafe.AsPointer(ref s);
+            }
+        }
+
+        public unsafe static string TestStringHandleOnStack(void* unmangedFnPtr, string stringToSet)
+        {
+            string retValue = Guid.NewGuid().ToString();
+            var shos = new StringHandleOnStack(ref retValue);
+
+            var fnPtr = (delegate* unmanaged<void*, string, void>)unmangedFnPtr;
+            fnPtr(&shos, stringToSet);
+            return retValue;
+        }
     }
 
     public class DerivedClass : TestClass

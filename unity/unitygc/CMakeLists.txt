@@ -1,5 +1,7 @@
 project(unitygc)
 
+cmake_minimum_required(VERSION 3.21)
+
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
 include_directories(../../src/coreclr/gc)

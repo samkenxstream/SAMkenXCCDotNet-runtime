@@ -476,6 +476,32 @@ TEST(mono_runtime_invoke_can_invoke_with_out_arg)
     CHECK_EQUAL(testObj, param2);
 }
 
+void set_string_handle_on_stack_test_method(void* stringHandleOnStack, char* stringToSet)
+{
+    mono_string_set_string_handle_on_stack_len(stringHandleOnStack, stringToSet, stringToSet ? strlen(stringToSet) : 0);
+}
+
+TEST(mono_string_set_string_handle_on_stack_len_test)
+{
+    MonoMethod* method = GetMethodHelper(kTestDLLNameSpace, kTestClassName, "TestStringHandleOnStack", 2);
+    const char* testString = "Hello, World!";
+    MonoString *str = mono_string_new_wrapper(testString);
+    void* params[2] = { set_string_handle_on_stack_test_method, str };
+
+    MonoObject* returnValue = mono_runtime_invoke(method, nullptr, params, nullptr);
+    char* returnStr = mono_string_to_utf8((MonoString*)returnValue);
+    CHECK_EQUAL_STR(testString, returnStr);
+}
+
+TEST(mono_string_set_string_handle_on_stack_len_null_value)
+{
+    MonoMethod* method = GetMethodHelper(kTestDLLNameSpace, kTestClassName, "TestStringHandleOnStack", 2);
+    void* params[2] = { set_string_handle_on_stack_test_method, nullptr };
+
+    MonoObject* returnValue = mono_runtime_invoke(method, nullptr, params, nullptr);
+    REQUIRE(returnValue == NULL);
+}
+
 TEST(mono_method_get_object_works)
 {
     MonoClass* klass = GetClassHelper(kTestDLLNameSpace, kTestClassName);

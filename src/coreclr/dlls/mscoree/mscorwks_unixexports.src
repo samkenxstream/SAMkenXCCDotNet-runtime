@@ -226,6 +226,7 @@ mono_stack_walk_no_il
 mono_string_from_utf16
 mono_string_new_len
 mono_string_new_utf16
+mono_string_set_string_handle_on_stack_len
 mono_string_new_wrapper
 mono_string_to_utf8
 mono_stringify_assembly_name

@@ -9,6 +9,7 @@
 #include "assemblynative.hpp"
 #include "caparser.h"
 #include "ecall.h"
+#include "qcall.h"
 #include "mscoree.h"
 #include "stringliteralmap.h"
 #include "threadlocalpoolallocator.h"
@@ -2941,14 +2942,46 @@ extern "C" EXPORT_API MonoString* EXPORT_CC mono_string_from_utf16(const gunicha
     return (MonoString*)OBJECTREFToObject(AllocateString(sstr));
 }
 
+static STRINGREF new_string_length(const char* text, guint32 length)
+{
+    CONTRACTL{
+        MODE_COOPERATIVE;
+        GC_TRIGGERS;
+        PRECONDITION(text != nullptr);
+    } CONTRACTL_END;
+
+    InlineSString<256> sstr(SString::Utf8, text, length);
+    STRINGREF strObj = AllocateString(sstr.GetCount());
+    memcpyNoGCRefs(strObj->GetBuffer(), sstr.GetUnicode(), sstr.GetCount() * sizeof(WCHAR));
+    return strObj;
+}
+
 extern "C" EXPORT_API MonoString* EXPORT_CC mono_string_new_len(MonoDomain *domain, const char *text, guint32 length)
 {
     assert(text != nullptr);
-    InlineSString<256> sstr(SString::Utf8, text, length);
     GCX_COOP();
-    STRINGREF strObj = AllocateString(sstr.GetCount());
-    memcpyNoGCRefs(strObj->GetBuffer(), sstr.GetUnicode(), sstr.GetCount() * sizeof(WCHAR));
+    STRINGREF strObj = new_string_length(text, length);
     return (MonoString*)OBJECTREFToObject(strObj);
+}
+
+extern "C" EXPORT_API void EXPORT_CC mono_string_set_string_handle_on_stack_len(void* stringHandleOnStack, const char* text, guint32 length)
+{
+    assert(stringHandleOnStack != nullptr);
+
+    // This is how QCalls return strings allocated in native code to managed
+    // See https://github.com/dotnet/coreclr/blob/master/Documentation/botr/mscorlib.md#qcall-functional-behavior
+
+    QCall::StringHandleOnStack* shos = reinterpret_cast<QCall::StringHandleOnStack*>(stringHandleOnStack);
+
+    GCX_COOP();
+
+    if (text == nullptr)
+    {
+        shos->Set(STRINGREF(nullptr));
+        return;
+    }
+
+    shos->Set(new_string_length(text, length));
 }
 
 extern "C" EXPORT_API MonoString* EXPORT_CC mono_string_new_utf16(MonoDomain * domain, const guint16 * text, gint32 length)

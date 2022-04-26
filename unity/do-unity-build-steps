@@ -1,0 +1,16 @@
+#!/bin/bash
+
+START_DIR=%cd%
+
+set -e
+
+./dotnet.sh build unity/managed.sln -c Release
+cd unitygc
+mkdir release
+cd release
+cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake --build .
+cd ../
+cp unity/unitygc/release/libunitygc.so artifacts/bin/microsoft.netcore.app.runtime.linux-x64/Release/runtimes/linux-x64/native
+cp artifacts/bin/unity-embed-host/Release/net6.0/unity-embed-host.dll artifacts/bin/microsoft.netcore.app.runtime.linux-x64/Release/runtimes/linux-x64/lib/net7.0
+cp artifacts/bin/unity-embed-host/Release/net6.0/unity-embed-host.dll artifacts/bin/microsoft.netcore.app.runtime.linux-x64/Release/runtimes/linux-x64/lib/net7.0

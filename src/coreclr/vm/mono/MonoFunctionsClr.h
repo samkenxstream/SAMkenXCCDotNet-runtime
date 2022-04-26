@@ -13,6 +13,7 @@ DO_API(MonoType*, mono_field_get_type_specific, (MonoClassField *field, MonoClas
 DO_API(void, mono_enter_internal_call,  (MonoInternalCallFrameOpaque *frame))
 DO_API(void, mono_exit_internal_call,  (MonoInternalCallFrameOpaque *frame))
 DO_API(void, mono_set_gc_conservative,  (bool conservative))
+DO_API(void, mono_string_set_string_handle_on_stack_len, (void* stringHandleOnStack, const char* text, guint32 length));
 
 #define ENABLE_MONO_MEMORY_PROFILER 1
 
